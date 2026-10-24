@@ -27,7 +27,14 @@
 
 ### 1. 先启动游戏
 
-正常用 `mice.exe` 启动，进到游戏画面（本项目实测窗口客户区 960×960 @ 屏幕 (800,240)）。
+用游戏目录里的 **`1start.bat`** 启动（它会改 `mice\config.ini` 的 `allnet` 为局域网 IP，并起
+`mice\portproxy_naominet.py` 做 80 端口的 naominet 桥，然后拉起 `mice.exe`）。
+**直接双击 `mice.exe` 会卡在黑屏** —— 没有那个桥，`ALLNetProc` 连不上 `192.168.31.27:80`。
+
+起来后停在游戏的**待机/等待画面**（黑屏结束后的那个画面，左边有个大圆）就行，
+服务端需要在这个画面里识别触摸面板圆。本项目实测窗口客户区 960×960 @ 屏幕 (800,240)。
+
+> 抓屏走的是桌面合成结果，所以**别让别的窗口盖住游戏**（`mice.exe` 的控制台也算）。
 
 ### 2. PC 端服务
 
@@ -60,7 +67,8 @@ powershell -ExecutionPolicy Bypass -File android\build.ps1 -Install          # �
 
 ### 4. 触摸面板
 
-画面内切圆就是触摸面板，无需校准（半径阈值由游戏端口协议固定）：
+面板几何**不用手工校准**：游戏待机画面左下角那个圆就是触摸面板边界，服务端自动检测并锁定它
+（圆心 = 面板中心，半径 = 面板半径），手机端画出来的环就压在那个圆上：
 
 ```
         A4  A3  A2
@@ -73,6 +81,36 @@ powershell -ExecutionPolicy Bypass -File android\build.ps1 -Install          # �
 
 编号从画面**右侧（3 点方向）**开始、顺时针排列。设置面板里可开关网格/编号、
 「吸附到传感器中心」（把触摸点吸到传感器中心，判定更宽松，默认开）。
+
+**拉缩矫正**：检测出的横向/纵向半径是分开取的（`rx`、`ry`），画面被拉伸或压扁时圆会变成椭圆，
+手机端的环也跟着画成同一个椭圆、触摸按同一个椭圆换算，所以永远和游戏里那个圆重合。
+
+**微调**：手机设置页有四个滑杆（圆心 X/Y、半径 X/Y），拖动时立刻按新圆换算并重画环，
+对齐游戏里那个圆以后点「保存到 PC」——值会写进 `pc/config.json` 的 `panel.manual`，
+以后启动直接用它（想回到自动检测就勾回「跟随游戏自动检测」）。
+
+面板状态可以在手机设置页或 `http://<PC-IP>:8770/api/panel` 看到：
+
+| `state` | 含义 |
+| --- | --- |
+| `dark` | 画面还是黑屏（游戏在启动），等亮起来再检测 |
+| `searching` / `lost` | 画面亮了但还没锁定（或曾经锁定后丢失），正在找圆 |
+| `locked` | 已锁定，触摸按这个圆换算 |
+| `manual` | 用 `pc/config.json` 里 `panel.manual` 手工指定 |
+| `full` | 没检测到圆，回落到「整幅画面就是面板」（旧行为） |
+
+锁定值会一直保留（面板本身不会动），画面切到选曲/游戏中也不会乱跳。
+想手工固定（也可以在手机设置页拖滑杆后「保存到 PC」）：
+
+```json
+"panel": { "auto": false, "manual": { "cx": 0.2515, "cy": 0.7165, "rx": 0.2493, "ry": 0.2806 } }
+```
+
+看一眼检测结果对不对（会生成两张图，`_raw` 是原图）：
+
+```powershell
+python tools\panel_preview.py            # 抓当前画面 + 检测 + 画环 → tools\probe_out\panel_overlay.png
+```
 
 ## 触摸是怎么进游戏的（走端口）
 
@@ -131,17 +169,20 @@ python pc\maitouch_port.py restore
 | 方向 | 消息 |
 | --- | --- |
 | PC→手机 | `{"t":"welcome", panel, video, window, touch_backend}` |
+| PC→手机 | `{"t":"panel", cx, cy, rx, ry, stretch, state, detected}`（面板圆锁定/丢失时主动推） |
 | 手机→PC | `{"t":"offer","sdp":...}` → PC 回 `{"t":"answer","sdp":...}` |
 | 手机→PC | `{"t":"touch","id":1..10,"a":"down|move|up","x":0..1,"y":0..1}` |
 | 手机→PC | `{"t":"ping","ts":毫秒}` → `{"t":"pong",...}` |
 
 `x,y` 是**游戏画面内的归一化坐标**（0,0 = 左上角，1,1 = 右下角），与手机分辨率/黑边无关。
-`panel` 里带半径阈值与传感器标号，手机端据此画网格。
+`panel` 里带面板圆（`cx, cy, rx, ry`）、半径阈值与传感器标号，手机端据此画环。
 
 ## 自测（不需要手机）
 
 ```powershell
-python pc\sensors.py                      # 17 传感器几何/包编解码自检
+python pc\sensors.py                      # 17 传感器几何/包编解码自检（含偏心/拉缩面板）
+python pc\panel_detect.py --track 10      # 实时看面板圆检测：dark → searching → locked
+python tools\test_panel_detect.py         # 面板圆检测单测（合成画面，21 项）
 python tools\selftest.py                  # 起服务 + 模拟手机，验证画面链路（PASS/FAIL）
 python tools\test_encoder.py              # NVENC 编码 + 解码回环
 python tools\test_port_backend.py         # 游戏运行时：端口写入路径 12 项检查
@@ -150,12 +191,18 @@ python tools\test_web_grid.py dump && node tools\test_web_grid.js   # 手机端�
 python tools\bench_video.py               # 抓屏/编码基准
 ```
 
-`test_e2e_touch.py` 会从**另一个进程**读游戏内存来核对：按中心/外环/内环/圆外、双指同按、
-松手回空闲、断线自动松手 —— 本项目实测 12/12 通过。
+`test_e2e_touch.py` 会先向服务端要面板圆，再从**另一个进程**读游戏内存来核对：按中心/外环/内环/圆外、
+双指同按、松手回空闲、断线自动松手 —— 本项目实测 14/14 通过（触摸坐标全部按检测到的圆换算）。
 
 ## 常见问题
 
 * **连不上**：确认手机与 PC 同网段；Windows 防火墙放行 `python.exe`（或 `8770` TCP）。
+* **手机上的环和游戏里的圆不重合**：先看 `/api/panel` 的 `state` 是不是 `locked`；
+  不是的话让游戏停在待机画面（黑屏结束后的画面，左下角有大圆）几秒，服务端会自动锁定。
+  仍不行就 `python tools\panel_preview.py` 生成 `tools\probe_out\panel_overlay.png` 看检测对不对，
+  然后用上面的 `panel.manual` 手工固定。
+* **画面上有两个一样的圆**：待机画面左右各有一个（两个玩家画面并排），服务端只用**左下角**那个；
+  要驱动另一侧需要另行扩展（见 `docs/architecture.md` §9）。
 * **画面有、触摸没反应**：看 `http://<PC-IP>:8770/api/status` 的 `game.touch_details`
   （`attached` / `frozen` / `packet` / `sensors`）与 `game.touch.errors`。
 * **游戏里鼠标点触摸面板失效**：说明 `build_status` 还处于冻结，5 秒后自动恢复；
@@ -173,6 +220,9 @@ python tools\bench_video.py               # 抓屏/编码基准
 * 17 个传感器 → maimai 自己 zone 命名（A1..E?）的展开由游戏决定，本次未逆向游戏本体，
   因此手机端标号是「屏幕方位」标号，可能与游戏内的 zone 名不完全对应。
 * 只支持这一套 micetools/mice.dll 版本：`build_status` 前导不是 `55 8B EC 83 E4 F8` 时会拒绝打补丁并报错。
+* **面板圆检测依赖游戏画的那个圆**：换了游戏版本/分辨率以后，`/api/panel` 的 `state` 会退回
+  `searching`（或 `full`），此时触摸按整幅画面换算，环的位置会和游戏不一致 —— 用 `panel.manual` 固定，
+  或调 `pc/config.json` 的 `panel.roi`（默认 `[0.0, 0.30, 0.55, 1.0]`，即左下角）。
 
 ## 免责 / 边界
 

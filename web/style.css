@@ -158,6 +158,22 @@ html, body {
 
 #panel input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
 
+#panel .sliders { display: flex; flex-direction: column; gap: 6px; }
+
+#panel .slider-title {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  color: var(--fg);
+  font-size: 13px;
+}
+
+#panel .slider { font-size: 12px; }
+#panel .slider > span { width: 48px; flex: 0 0 auto; }
+#panel .slider > output { width: 52px; flex: 0 0 auto; text-align: right; color: var(--accent); font-variant-numeric: tabular-nums; }
+
 #hud-model { color: var(--accent); }
 
 #panel .hint {

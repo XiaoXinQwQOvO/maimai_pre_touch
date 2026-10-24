@@ -36,13 +36,28 @@
       <label><input id="chk-grid" type="checkbox" /> 显示面板网格</label>
       <label><input id="chk-labels" type="checkbox" /> 显示编号</label>
     </section>
+    <section class="sliders">
+      <div class="slider-title">
+        <span>面板圆微调</span>
+        <label><input id="chk-auto" type="checkbox" /> 跟随游戏自动检测</label>
+      </div>
+      <label class="slider"><span>圆心 X</span><input id="in-cx" type="range" min="0" max="1" step="0.001" /><output id="out-cx"></output></label>
+      <label class="slider"><span>圆心 Y</span><input id="in-cy" type="range" min="0" max="1" step="0.001" /><output id="out-cy"></output></label>
+      <label class="slider"><span>半径 X</span><input id="in-rx" type="range" min="0.02" max="1" step="0.001" /><output id="out-rx"></output></label>
+      <label class="slider"><span>半径 Y</span><input id="in-ry" type="range" min="0.02" max="1" step="0.001" /><output id="out-ry"></output></label>
+      <div class="row small">
+        <button id="btn-save-panel">保存到 PC</button>
+        <button id="btn-reload-panel">读取 PC 的值</button>
+      </div>
+    </section>
     <section class="row">
       <button id="btn-reset">恢复默认几何</button>
     </section>
     <section class="hint">
-      画面外圈就是触摸面板：由内到外 <b>C</b> 中心圆 → <b>B1–B8</b> 内环 → <b>A1–A8</b> 外环，
-      共 17 个传感器（与 micetools 的 maitouch 端口一致）。编号从画面右侧（3 点方向）开始、顺时针排列。
-      半径边界为 0.2241 / 0.5518 / 1.0（以画面内切圆为 1.0），由游戏端口协议固定，无需校准。
+      触摸面板就是游戏待机画面左下角那个圆：PC 自动检测圆心和半径，触摸按这个圆换算，
+      手机上的环会压在游戏里那个圆上。检测不准时用上面的滑杆微调，对齐后「保存到 PC」
+      （之后即使游戏画面切换也不会变）。由内到外 <b>C</b> 中心圆 → <b>B1–B8</b> 内环 →
+      <b>A1–A8</b> 外环，共 17 个传感器，编号从画面右侧（3 点方向）开始顺时针。
     </section>
     <section class="hint" id="hud-model"></section>
     <section class="row small">

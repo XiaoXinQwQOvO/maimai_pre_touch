@@ -99,5 +99,10 @@ def client_rect(win) -> tuple[int, int, int, int]:
 
 
 def bring_to_front(win) -> None:
-    user32.SetForegroundWindow(win["hwnd"])
-    user32.SetWindowPos(win["hwnd"], -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+    """Raise the window above everything without leaving it permanently topmost."""
+    hwnd = win["hwnd"] if isinstance(win, dict) else win
+    flags = 0x0001 | 0x0002 | 0x0040  # NOSIZE | NOMOVE | SHOWWINDOW
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, flags)  # HWND_TOPMOST
+    user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, flags)  # HWND_NOTOPMOST
+    user32.SetForegroundWindow(hwnd)

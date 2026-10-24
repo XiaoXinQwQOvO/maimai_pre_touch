@@ -79,9 +79,43 @@ def _normalise(nx: float, ny: float) -> tuple[float, float, float]:
     return u, v, math.hypot(u, v)
 
 
-def sensor_at(nx: float, ny: float) -> str | None:
+#: the whole frame is the panel when nothing has been detected (legacy behaviour)
+PANEL_FULL = {"cx": 0.5, "cy": 0.5, "rx": 0.5, "ry": 0.5}
+
+
+def normalise_panel(panel) -> tuple[float, float, float, float]:
+    """Accept None, a dict (``cx, cy, rx/ry`` or ``cx, cy, r``) or a 4-tuple."""
+    if panel is None:
+        panel = PANEL_FULL
+    if isinstance(panel, dict):
+        cx = float(panel.get("cx", 0.5))
+        cy = float(panel.get("cy", 0.5))
+        radius = float(panel.get("r", 0.5) or 0.5)
+        rx = float(panel.get("rx", radius) or radius)
+        ry = float(panel.get("ry", radius) or radius)
+    else:
+        cx, cy, rx, ry = (float(value) for value in panel)
+    if rx <= 0.0 or ry <= 0.0:
+        raise ValueError(f"panel radius must be positive, got rx={rx} ry={ry}")
+    return cx, cy, rx, ry
+
+
+def to_uv(nx: float, ny: float, panel=None) -> tuple[float, float]:
+    """Frame-normalised point -> panel coordinates (0,0 = panel centre, 1 = rim)."""
+    cx, cy, rx, ry = normalise_panel(panel)
+    return (nx - cx) / rx, (ny - cy) / ry
+
+
+def from_uv(u: float, v: float, panel=None) -> tuple[float, float]:
+    """Panel coordinates -> frame-normalised point."""
+    cx, cy, rx, ry = normalise_panel(panel)
+    return cx + u * rx, cy + v * ry
+
+
+def sensor_at(nx: float, ny: float, panel=None) -> str | None:
     """Which sensor does a normalised point (0..1, 0..1) land on? None if outside."""
-    u, v, r = _normalise(nx, ny)
+    u, v = to_uv(nx, ny, panel)
+    r = math.hypot(u, v)
     if r >= R_MAX:
         return None
     if r < R_CENTRE:
@@ -99,17 +133,18 @@ def sensor_radius(name: str) -> float:
     return (R_INNER + R_MAX) / 2.0
 
 
-def sensor_point(name: str) -> tuple[float, float]:
+def sensor_point(name: str, panel=None) -> tuple[float, float]:
     """Representative normalised point of a sensor (mid radius, sector centre)."""
     name = name.upper()
     if name not in SENSORS:
         raise KeyError(f"unknown sensor {name!r}; known: {SENSOR_ORDER}")
     if name == CENTRE:
-        return 0.5, 0.5
+        cx, cy, _, _ = normalise_panel(panel)
+        return cx, cy
     sector = int(name[1:]) // 45
     angle = math.radians(sector * SECTOR_DEG + SECTOR_DEG / 2.0)
     radius = sensor_radius(name)
-    return 0.5 + (radius * math.cos(angle)) / 2.0, 0.5 + (radius * math.sin(angle)) / 2.0
+    return from_uv(radius * math.cos(angle), radius * math.sin(angle), panel)
 
 
 def packet_from_sensors(names) -> bytes:
@@ -145,12 +180,31 @@ def describe(packet: bytes) -> str:
     return " ".join(f"{name}({LABELS[name]})" for name in active)
 
 
-def snap_to_sensor(nx: float, ny: float) -> tuple[float, float]:
+def snap_to_sensor(nx: float, ny: float, panel=None) -> tuple[float, float]:
     """Snap a raw touch onto the centre of the sensor it landed on (outside -> unchanged)."""
-    name = sensor_at(nx, ny)
+    name = sensor_at(nx, ny, panel)
     if name is None:
         return nx, ny
-    return sensor_point(name)
+    return sensor_point(name, panel)
+
+
+def panel_geometry(panel=None) -> dict:
+    """Panel description for the phone overlay / API (all values are frame fractions)."""
+    cx, cy, rx, ry = normalise_panel(panel)
+    return {
+        "cx": cx,
+        "cy": cy,
+        "rx": rx,
+        "ry": ry,
+        "r_centre": R_CENTRE,
+        "r_inner": R_INNER,
+        "r_max": R_MAX,
+        "sectors": SECTORS,
+        "labels": LABELS,
+        "count": len(SENSORS),
+        "order": SENSOR_ORDER,
+        "stretch": rx / ry if ry else 1.0,
+    }
 
 
 def _selfcheck() -> int:
@@ -179,6 +233,24 @@ def _selfcheck() -> int:
         if sensors_in(packet) != [name]:
             failures += 1
             print(f"[!] packet round-trip failed for {name}: {sensors_in(packet)}")
+
+    # a detected panel (off-centre, stretched) must still round-trip
+    detected = {"cx": 0.2516, "cy": 0.7165, "rx": 0.275, "ry": 0.2812}
+    print("\ndetected panel:", detected)
+    for name in SENSOR_ORDER:
+        px, py = sensor_point(name, detected)
+        back = sensor_at(px, py, detected)
+        if back != name:
+            failures += 1
+            print(f"[!] panel round-trip failed for {name}: got {back} at ({px:.4f}, {py:.4f})")
+    # the rim is the outside boundary: just inside hits the outer ring, just outside nothing
+    rim_in = sensor_at(detected["cx"] + detected["rx"] * 0.98, detected["cy"], detected)
+    rim_out = sensor_at(detected["cx"] + detected["rx"] * 1.02, detected["cy"], detected)
+    print(f"panel rim     : 0.98r -> {rim_in};  1.02r -> {rim_out}")
+    if rim_in != "O0" or rim_out is not None:
+        failures += 1
+        print("[!] panel rim mapping is off")
+
     print(f"\nSELFCHECK: {'PASS' if failures == 0 else f'FAIL ({failures})'}")
     return 0 if failures == 0 else 1
 

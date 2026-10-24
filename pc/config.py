@@ -23,6 +23,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "process_names": ["maimai_dump_.exe", "maimai.exe"],
         "max_contacts": 10,
     },
+    "panel": {
+        # the game draws the touch panel as a circle on its waiting screen; detect it
+        # there and use it as the touch geometry (centre = panel centre, rim = edge)
+        "auto": True,
+        "detect_interval": 0.5,
+        "dark_threshold": 24.0,
+        "lock_frames": 3,
+        "tolerance": 0.04,
+        "verify_interval": 2.0,
+        # manual override, used when auto detection is off or nothing is found:
+        # {"cx": 0.5, "cy": 0.5, "rx": 0.5, "ry": 0.5}  (fractions of the frame)
+        "manual": None,
+        # the circle is expected in the lower-left corner of the game picture
+        "roi": [0.0, 0.3, 0.55, 1.0],
+    },
     "debug": {"log_level": "INFO", "save_frames": False},
 }
 

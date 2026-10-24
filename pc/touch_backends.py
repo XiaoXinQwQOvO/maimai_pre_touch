@@ -33,7 +33,11 @@ log = logging.getLogger(__name__)
 class TouchBackend:
     name = "base"
 
-    def __init__(self):
+    def __init__(self, panel_provider=None):
+        # ``panel_provider()`` returns the detected panel circle (centre + radii) or
+        # None for "the whole frame is the panel"; it must be cheap to call - it runs
+        # for every touch event
+        self._panel_provider = panel_provider
         self.stats = {
             "presses": 0,
             "moves": 0,
@@ -43,6 +47,20 @@ class TouchBackend:
             "active": 0,
             "last_event": 0.0,
         }
+
+    def _panel(self):
+        if self._panel_provider is None:
+            return None
+        try:
+            panel = self._panel_provider()
+        except Exception:  # noqa: BLE001 - never break touch because of detection
+            return None
+        if isinstance(panel, tuple):
+            panel = panel[0]
+        return panel
+
+    def _sensor(self, nx: float, ny: float):
+        return sensors.sensor_at(nx, ny, self._panel())
 
     def _touch(self) -> None:
         self.stats["last_event"] = time.time()
@@ -76,8 +94,8 @@ class MaitouchPortBackend(TouchBackend):
 
     name = "maitouch"
 
-    def __init__(self, process_names=None, watch_interval: float = 1.0):
-        super().__init__()
+    def __init__(self, process_names=None, watch_interval: float = 1.0, panel_provider=None):
+        super().__init__(panel_provider)
         import atexit
 
         from maitouch_port import MaitouchPort
@@ -155,7 +173,7 @@ class MaitouchPortBackend(TouchBackend):
 
     # -- interface ----------------------------------------------------------
     def press(self, contact_id: int, nx: float, ny: float) -> None:
-        sensor = sensors.sensor_at(nx, ny)
+        sensor = self._sensor(nx, ny)
         if sensor is None:
             self._contacts.pop(contact_id, None)
             self.stats["dropped"] += 1
@@ -170,7 +188,7 @@ class MaitouchPortBackend(TouchBackend):
         self._touch()
 
     def move(self, contact_id: int, nx: float, ny: float) -> None:
-        sensor = sensors.sensor_at(nx, ny)
+        sensor = self._sensor(nx, ny)
         if sensor is None or sensor == self._contacts.get(contact_id):
             self.stats["moves"] += 1
             self._touch()
@@ -210,8 +228,8 @@ class SyntheticTouchBackend(TouchBackend):
 
     name = "synth"
 
-    def __init__(self, client_rect_provider, max_contacts: int = 10):
-        super().__init__()
+    def __init__(self, client_rect_provider, max_contacts: int = 10, panel_provider=None):
+        super().__init__(panel_provider)
         from touch_inject import SyntheticTouch
 
         self._rect_provider = client_rect_provider
@@ -293,12 +311,12 @@ class LogBackend(TouchBackend):
 
     name = "log"
 
-    def __init__(self, *_args, **_kwargs):
-        super().__init__()
+    def __init__(self, *_args, panel_provider=None, **_kwargs):
+        super().__init__(panel_provider)
         self._ids: dict[int, str] = {}
 
     def press(self, contact_id: int, nx: float, ny: float) -> None:
-        sensor = sensors.sensor_at(nx, ny)
+        sensor = self._sensor(nx, ny)
         self._ids[contact_id] = sensor or "outside"
         self.stats["presses"] += 1
         self.stats["active"] = len(self._ids)
@@ -323,13 +341,17 @@ class LogBackend(TouchBackend):
         self.stats["active"] = 0
 
 
-def create_backend(cfg: dict, client_rect_provider, zone_map=None) -> TouchBackend:
+def create_backend(cfg: dict, client_rect_provider, zone_map=None, panel_provider=None) -> TouchBackend:
     kind = (cfg or {}).get("backend", "maitouch").lower()
     max_contacts = int((cfg or {}).get("max_contacts", 10))
     if kind in ("maitouch", "port"):
-        return MaitouchPortBackend(process_names=(cfg or {}).get("process_names"))
+        return MaitouchPortBackend(
+            process_names=(cfg or {}).get("process_names"), panel_provider=panel_provider
+        )
     if kind == "synth":
-        return SyntheticTouchBackend(client_rect_provider, max_contacts=max_contacts)
+        return SyntheticTouchBackend(
+            client_rect_provider, max_contacts=max_contacts, panel_provider=panel_provider
+        )
     if kind == "log":
-        return LogBackend()
+        return LogBackend(panel_provider=panel_provider)
     raise ValueError(f"unknown touch backend: {kind}")

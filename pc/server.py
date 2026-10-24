@@ -43,16 +43,112 @@ def lan_ip() -> str:
         return "127.0.0.1"
 
 
-def panel_geometry() -> dict:
-    """The sensor layout the phone should draw (see pc/sensors.py)."""
-    return {
-        "r_centre": sensors.R_CENTRE,
-        "r_inner": sensors.R_INNER,
-        "r_max": sensors.R_MAX,
-        "sectors": sensors.SECTORS,
-        "labels": sensors.LABELS,
-        "count": len(sensors.SENSORS),
-    }
+def panel_geometry(panel=None, detected: bool = False, state: str = "full") -> dict:
+    """The sensor layout + panel circle the phone should draw (see pc/sensors.py)."""
+    geometry = sensors.panel_geometry(panel)
+    geometry.update({"detected": detected, "state": state})
+    return geometry
+
+
+class PanelWatcher(threading.Thread):
+    """Watches the captured picture for the panel circle the game draws.
+
+    The circle appears on the waiting screen that follows the boot black screen, so
+    detection waits for the picture to get bright, then locks the circle.  While it is
+    locked that circle - not the whole frame - is the touch geometry.
+    """
+
+    def __init__(self, capture, cfg: dict):
+        super().__init__(name="panel-watcher", daemon=True)
+        self.capture = capture
+        self.cfg = dict(cfg or {})
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._manual = self.cfg.get("manual")
+        self._tracker = None
+        self._panel: dict | None = None
+        self.misses = 0
+
+    # --- lifecycle ---------------------------------------------------------
+
+    def run(self) -> None:
+        import panel_detect
+
+        interval = float(self.cfg.get("detect_interval", 0.5))
+        self._tracker = panel_detect.PanelTracker(
+            dark_threshold=float(self.cfg.get("dark_threshold", 24.0)),
+            lock_frames=int(self.cfg.get("lock_frames", 3)),
+            tolerance=float(self.cfg.get("tolerance", 0.04)),
+            verify_interval=float(self.cfg.get("verify_interval", 2.0)),
+            roi=tuple(self.cfg.get("roi") or (0.0, 0.30, 0.55, 1.0)),
+            log=log,
+        )
+        if self.cfg.get("auto", True) is False:
+            log.info("panel: auto detection disabled, using %s", self._manual or "the whole frame")
+            return
+        while not self._stop.is_set():
+            frame = None
+            try:
+                frame = self.capture.get_frame()
+            except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                log.debug("panel: capture failed: %s", exc)
+            if frame is None:
+                self._stop.wait(interval)
+                continue
+            if frame.ndim == 3 and frame.shape[2] == 4:
+                frame = frame[:, :, :3]
+            try:
+                status = self._tracker.update(frame)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("panel: detection failed: %s", exc)
+                self._stop.wait(interval)
+                continue
+            with self._lock:
+                self._panel = self._tracker.panel()
+            self._stop.wait(interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # --- manual override ---------------------------------------------------
+
+    def set_manual(self, panel: dict | None) -> None:
+        """Pin the panel geometry (or drop the pin and go back to auto detection)."""
+        with self._lock:
+            self._manual = dict(panel) if panel else None
+        if panel:
+            log.info(
+                "panel: manual geometry cx=%.4f cy=%.4f rx=%.4f ry=%.4f",
+                panel["cx"],
+                panel["cy"],
+                panel["rx"],
+                panel["ry"],
+            )
+        else:
+            log.info("panel: manual geometry cleared, back to auto detection")
+
+    # --- queries -----------------------------------------------------------
+
+    def effective(self) -> tuple[dict | None, str]:
+        """(panel or None, state) - manual override wins, then the locked circle."""
+        if self._manual:
+            return dict(self._manual), "manual"
+        with self._lock:
+            panel = dict(self._panel) if self._panel else None
+        if panel is not None:
+            return panel, "locked"
+        state = getattr(self._tracker, "state", "starting")
+        return None, state
+
+    def status(self) -> dict:
+        panel, state = self.effective()
+        tracker_state = getattr(self._tracker, "state", "starting") if self._tracker else "starting"
+        return {
+            "auto": bool(self.cfg.get("auto", True)),
+            "state": state,
+            "tracker_state": tracker_state,
+            "panel": panel,
+        }
 
 
 class GameState:
@@ -71,17 +167,20 @@ class GameState:
 
         touch_cfg = dict(cfg.get("touch", {}))
         touch_cfg.setdefault("process_names", tuple(cfg.get("capture", {}).get("process_names", ())))
-        self.touch = create_backend(touch_cfg, self.client_rect)
         self.capture = CaptureManager(cfg.get("capture", {}), self.region_for_capture)
+        self.panel_watcher = PanelWatcher(self.capture, cfg.get("panel", {}))
+        self.touch = create_backend(touch_cfg, self.client_rect, panel_provider=self.panel)
         self.tracker = threading.Thread(target=self._track_loop, name="window-tracker", daemon=True)
 
     # --- window tracking ---------------------------------------------------
 
     def start(self) -> None:
         self.tracker.start()
+        self.panel_watcher.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self.panel_watcher.stop()
         self.touch.close()
         self.capture.close()
 
@@ -123,6 +222,7 @@ class GameState:
 
     def status(self) -> dict:
         rect = self.client_rect()
+        panel, panel_state = self.panel_watcher.effective()
         return {
             "window": self.window_title,
             "window_present": bool(self._win),
@@ -132,8 +232,12 @@ class GameState:
             "touch": dict(self.touch.stats),
             "touch_backend": self.touch.describe(),
             "touch_details": self.touch.details(),
-            "panel": panel_geometry(),
+            "panel": panel_geometry(panel, detected=bool(panel) and panel_state in ("locked", "manual"), state=panel_state),
+            "panel_detect": self.panel_watcher.status(),
         }
+
+    def panel(self) -> tuple[dict | None, str]:
+        return self.panel_watcher.effective()
 
 
 class App:
@@ -169,7 +273,54 @@ class App:
         return web.json_response({"ok": True})
 
     async def panel(self, request: web.Request):
-        return web.json_response({"ok": True, **panel_geometry()})
+        panel, state = self.state.panel()
+        return web.json_response(
+            {"ok": True, **panel_geometry(panel, detected=bool(panel) and state in ("locked", "manual"), state=state)}
+        )
+
+    async def panel_set(self, request: web.Request):
+        """Pin (POST geometry) or release ({"auto": true}) the panel circle."""
+        try:
+            data = await request.json()
+        except Exception:  # noqa: BLE001
+            return web.json_response({"ok": False, "error": "expected JSON"}, status=400)
+
+        if data.get("auto"):
+            self.state.panel_watcher.set_manual(None)
+            if data.get("save"):
+                self._persist_panel(None)
+            panel, state = self.state.panel()
+            return web.json_response(
+                {"ok": True, **panel_geometry(panel, detected=bool(panel) and state in ("locked", "manual"), state=state)}
+            )
+
+        try:
+            panel = {key: float(data[key]) for key in ("cx", "cy", "rx", "ry")}
+        except (KeyError, TypeError, ValueError):
+            return web.json_response({"ok": False, "error": "cx, cy, rx, ry required"}, status=400)
+        if not (-0.5 <= panel["cx"] <= 1.5 and -0.5 <= panel["cy"] <= 1.5):
+            return web.json_response({"ok": False, "error": "centre out of range"}, status=400)
+        if not (0.01 <= panel["rx"] <= 1.5 and 0.01 <= panel["ry"] <= 1.5):
+            return web.json_response({"ok": False, "error": "radius out of range"}, status=400)
+
+        self.state.panel_watcher.set_manual(panel)
+        if data.get("save"):
+            self._persist_panel(panel)
+        current, state = self.state.panel()
+        return web.json_response(
+            {"ok": True, **panel_geometry(current, detected=True, state=state)}
+        )
+
+    def _persist_panel(self, panel: dict | None) -> None:
+        path = getattr(self.state, "cfg_path", config_mod.CONFIG_PATH)
+        try:
+            cfg = config_mod.load(path)
+            cfg.setdefault("panel", {})["manual"] = panel
+            cfg["panel"]["auto"] = panel is None
+            config_mod.save(cfg, path)
+            log.info("panel: %s saved to %s", "manual geometry" if panel else "auto detection", path)
+        except Exception as exc:  # noqa: BLE001 - never fail the request because of disk
+            log.warning("panel: could not save to %s: %s", path, exc)
 
     # --- WebSocket ---------------------------------------------------------
 
@@ -187,12 +338,13 @@ class App:
             if not ws.closed:
                 await ws.send_str(json.dumps(payload))
 
+        panel, panel_state = self.state.panel()
         await send(
             {
                 "t": "welcome",
                 "server": "maimai_pre_touch",
                 "version": 1,
-                "panel": panel_geometry(),
+                "panel": panel_geometry(panel, detected=bool(panel) and panel_state in ("locked", "manual"), state=panel_state),
                 "window": self.state.status()["client_rect"],
                 "touch_backend": self.state.touch.describe(),
                 "video": {
@@ -202,6 +354,27 @@ class App:
                 },
             }
         )
+
+        async def push_panel():
+            """Tell the phone as soon as the panel circle is (re)locked or lost."""
+            last = panel
+            while True:
+                current, current_state = self.state.panel()
+                if current != last:
+                    last = current
+                    await send(
+                        {
+                            "t": "panel",
+                            **panel_geometry(
+                                current,
+                                detected=bool(current) and current_state in ("locked", "manual"),
+                                state=current_state,
+                            ),
+                        }
+                    )
+                await asyncio.sleep(0.5)
+
+        panel_task = asyncio.ensure_future(push_panel())
 
         active: set[int] = set()
         try:
@@ -257,11 +430,14 @@ class App:
                         await send({"t": "answer", "sdp": sdp, "type": peer.localDescription.type})
                     elif kind == "touch":
                         self._handle_touch(data, active)
+                    elif kind == "panel-auto":
+                        self.state.panel_watcher.set_manual(None)
                     elif kind == "stats":
                         await send({"t": "stats", "video": self.video_track.stats, "game": self.state.status()})
                 elif message.type == WSMsgType.ERROR:
                     break
         finally:
+            panel_task.cancel()
             if active:
                 # never leave a finger pressed when the phone goes away
                 for contact_id in list(active):
@@ -285,8 +461,9 @@ class App:
         nx = float(data.get("x", 0.0))
         ny = float(data.get("y", 0.0))
         snap = bool(data.get("snap", False))
+        panel, _ = self.state.panel()
         if snap:
-            nx, ny = sensors.snap_to_sensor(nx, ny)
+            nx, ny = sensors.snap_to_sensor(nx, ny, panel)
         try:
             if action == "down":
                 self.state.touch.press(contact_id, nx, ny)
@@ -310,6 +487,7 @@ def make_app(cfg: dict, state: GameState) -> web.Application:
     app.router.add_get("/api/status", app_impl.status)
     app.router.add_get("/healthz", app_impl.healthz)
     app.router.add_get("/api/panel", app_impl.panel)
+    app.router.add_post("/api/panel", app_impl.panel_set)
     if os.path.isdir(WEB_DIR):
         app.router.add_static("/app/", WEB_DIR, show_index=False)
     return app
@@ -332,8 +510,16 @@ async def run(args) -> None:
 
     follow = not args.no_follow_window
     state = GameState(cfg, region_override=args.region, follow_window=follow)
+    state.cfg_path = args.config or config_mod.CONFIG_PATH
     state.start()
     log.info("panel: %d sensors (centre %.4f, inner ring %.4f)", len(sensors.SENSORS), sensors.R_CENTRE, sensors.R_INNER)
+    panel_cfg = cfg.get("panel", {})
+    if panel_cfg.get("manual"):
+        log.info("panel: manual geometry %s", panel_cfg["manual"])
+    elif panel_cfg.get("auto", True):
+        log.info("panel: waiting for the game's panel circle (bottom-left of the picture)")
+    else:
+        log.info("panel: auto detection off, the whole picture is the panel")
     log.info("touch backend: %s", state.touch.describe())
 
     app = make_app(cfg, state)

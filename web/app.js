@@ -9,8 +9,14 @@
  *    outer ring        r <  1.0             -> A1..A8
  *    outside           r >= 1.0             -> ignored
  *
- * where r is measured in units of half the game client area, 0 deg points to
- * screen-right and grows clockwise (8 sectors of 45 deg).
+ * where r is measured in units of the panel radius, 0 deg points to screen-right
+ * and grows clockwise (8 sectors of 45 deg).
+ *
+ * The panel is *not* the whole picture: the game draws it as a circle on its
+ * waiting screen (lower-left corner), the PC detects that circle and sends its
+ * centre and radii (cx, cy, rx, ry - fractions of the video frame).  Using the
+ * detected circle keeps this overlay exactly on top of the game's own circle even
+ * when the picture is stretched or letterboxed.
  *
  * Coordinates sent to the PC are normalised to the video content box (the game
  * client area), so phone resolution, orientation and letterboxing do not matter.
@@ -18,7 +24,18 @@
 (() => {
   "use strict";
 
-  const PANEL_DEFAULT = { r_centre: 0.2241, r_inner: 0.5518, r_max: 1.0, sectors: 8 };
+  const PANEL_DEFAULT = {
+    cx: 0.5,
+    cy: 0.5,
+    rx: 0.5,
+    ry: 0.5,
+    r_centre: 0.2241,
+    r_inner: 0.5518,
+    r_max: 1.0,
+    sectors: 8,
+    detected: false,
+    state: "full",
+  };
 
   const stage = document.getElementById("stage");
   const video = document.getElementById("video");
@@ -51,6 +68,7 @@
   const state = {
     server: store.get("server", location.host),
     panel: Object.assign({}, PANEL_DEFAULT, store.get("panel", {})),
+    manual: store.get("manual", false),
     snap: store.get("snap", true),
     showGrid: store.get("showGrid", true),
     showLabels: store.get("showLabels", true),
@@ -70,9 +88,17 @@
   const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
   // ------------------------------------------------------------- sensor math
+  // Frame fractions -> panel units (0,0 = panel centre, 1 = rim).
+  function toPanel(nx, ny, model) {
+    return [(nx - model.cx) / model.rx, (ny - model.cy) / model.ry];
+  }
+
+  function fromPanel(u, v, model) {
+    return [model.cx + u * model.rx, model.cy + v * model.ry];
+  }
+
   function sensorAt(nx, ny, model) {
-    const u = 2 * nx - 1;
-    const v = 2 * ny - 1;
+    const [u, v] = toPanel(nx, ny, model);
     const r = Math.hypot(u, v);
     if (r >= model.r_max) return null;
     if (r < model.r_centre) return { name: "C", label: "C", radius: 0, sector: -1 };
@@ -88,12 +114,12 @@
   }
 
   function sensorPoint(sensor, model) {
-    if (!sensor || sensor.name === "C") return [0.5, 0.5];
+    if (!sensor || sensor.name === "C") return [model.cx, model.cy];
     const radius = sensor.name.startsWith("I")
       ? (model.r_centre + model.r_inner) / 2
       : (model.r_inner + model.r_max) / 2;
     const angle = ((sensor.sector + 0.5) * (360 / model.sectors) * Math.PI) / 180;
-    return [0.5 + (radius * Math.cos(angle)) / 2, 0.5 + (radius * Math.sin(angle)) / 2];
+    return fromPanel(radius * Math.cos(angle), radius * Math.sin(angle), model);
   }
 
   // ---------------------------------------------------------------- geometry
@@ -184,14 +210,14 @@
   async function handleMessage(msg) {
     switch (msg.t) {
       case "welcome":
-        if (msg.panel) {
-          state.panel = Object.assign({}, PANEL_DEFAULT, msg.panel);
-          syncPanel();
-        }
+        if (msg.panel) applyPanel(msg.panel);
         if (msg.touch_backend) {
           state.touchBackend = msg.touch_backend;
           hudNet.textContent = "已连接 · " + state.server + " · " + state.touchBackend;
         }
+        break;
+      case "panel":
+        applyPanel(msg);
         break;
       case "answer":
         if (state.pc && msg.sdp) {
@@ -337,6 +363,55 @@
   stage.addEventListener("contextmenu", (e) => e.preventDefault());
   document.addEventListener("gesturestart", (e) => e.preventDefault());
 
+  // ------------------------------------------------- detected panel circle
+  const PANEL_STATE_TEXT = {
+    full: "整幅画面（未检测到圆）",
+    locked: "已锁定游戏内的圆",
+    manual: "手动设置",
+    searching: "检测中…",
+    lost: "重新检测中…",
+    dark: "等待游戏画面（黑屏）",
+    starting: "启动中…",
+  };
+
+  function applyPanel(incoming) {
+    const model = Object.assign({}, PANEL_DEFAULT, incoming || {});
+    // guard against a broken message: rx/ry must be sane fractions
+    if (!(model.rx > 0.01 && model.rx <= 1.5) || !(model.ry > 0.01 && model.ry <= 1.5)) {
+      return;
+    }
+    // a local fine-tune wins over the PC's auto detection (until "跟随自动检测")
+    if (state.manual) {
+      state.panel = Object.assign({}, model, {
+        cx: state.panel.cx,
+        cy: state.panel.cy,
+        rx: state.panel.rx,
+        ry: state.panel.ry,
+        state: "manual",
+        detected: true,
+      });
+    } else {
+      state.panel = model;
+    }
+    syncPanel();
+  }
+
+  function applyPanelLocal(model) {
+    state.panel = Object.assign({}, model, { state: "manual", detected: true });
+    syncPanel();
+  }
+
+  function panelSummary() {
+    const model = state.panel;
+    const stateText = PANEL_STATE_TEXT[model.state] || model.state || "";
+    if (!model.detected) return "面板：" + stateText;
+    const ax = (model.rx * 100).toFixed(1);
+    const ay = (model.ry * 100).toFixed(1);
+    const stretch = (model.rx / model.ry).toFixed(3);
+    return "面板：" + stateText + " · 圆心 " + (model.cx * 100).toFixed(1) + "% / " + (model.cy * 100).toFixed(1) +
+      "% · 半径 " + ax + "% / " + ay + "% · 拉伸 " + stretch;
+  }
+
   // --------------------------------------------------------------- overlay
   function resizeCanvas() {
     const dpr = Math.min(window.devicePixelRatio || 1, 3);
@@ -351,25 +426,36 @@
     const h = stage.clientHeight;
     ctx.clearRect(0, 0, w, h);
     const box = contentBox();
-    const cx = box.x + box.w / 2;
-    const cy = box.y + box.h / 2;
-    const unit = Math.min(box.w, box.h) / 2;
     const model = state.panel;
+    // the panel circle in canvas pixels; rx/ry keep it on the game's circle even
+    // when the picture is stretched (they come from the detected circle)
+    const cx = box.x + model.cx * box.w;
+    const cy = box.y + model.cy * box.h;
+    const rx = model.rx * box.w;
+    const ry = model.ry * box.h;
+
+    const ringPath = (radius) => {
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, Math.max(1, radius * rx), Math.max(1, radius * ry), 0, 0, Math.PI * 2);
+    };
 
     if (state.showGrid) {
+      ctx.strokeStyle = model.detected ? "rgba(79, 209, 255, 0.60)" : "rgba(79, 209, 255, 0.30)";
+      ctx.lineWidth = model.detected ? 2 : 1;
+      ringPath(model.r_max);
+      ctx.stroke();
       ctx.strokeStyle = "rgba(79, 209, 255, 0.30)";
       ctx.lineWidth = 1;
-      for (const radius of [model.r_centre, model.r_inner, model.r_max]) {
-        ctx.beginPath();
-        ctx.arc(cx, cy, radius * unit, 0, Math.PI * 2);
+      for (const radius of [model.r_centre, model.r_inner]) {
+        ringPath(radius);
         ctx.stroke();
       }
       const sectors = model.sectors;
       for (let i = 0; i < sectors; i++) {
         const angle = (i * (360 / sectors) * Math.PI) / 180;
         ctx.beginPath();
-        ctx.moveTo(cx + model.r_centre * unit * Math.cos(angle), cy + model.r_centre * unit * Math.sin(angle));
-        ctx.lineTo(cx + model.r_max * unit * Math.cos(angle), cy + model.r_max * unit * Math.sin(angle));
+        ctx.moveTo(cx + model.r_centre * rx * Math.cos(angle), cy + model.r_centre * ry * Math.sin(angle));
+        ctx.lineTo(cx + model.r_max * rx * Math.cos(angle), cy + model.r_max * ry * Math.sin(angle));
         ctx.stroke();
       }
       if (state.showLabels) {
@@ -380,10 +466,10 @@
         ctx.fillText("C", cx, cy);
         for (let s = 0; s < sectors; s++) {
           const angle = ((s + 0.5) * (360 / sectors) * Math.PI) / 180;
-          const innerR = ((model.r_centre + model.r_inner) / 2) * unit;
-          const outerR = ((model.r_inner + model.r_max) / 2) * unit;
-          ctx.fillText("B" + (s + 1), cx + innerR * Math.cos(angle), cy + innerR * Math.sin(angle));
-          ctx.fillText("A" + (s + 1), cx + outerR * Math.cos(angle), cy + outerR * Math.sin(angle));
+          const innerR = (model.r_centre + model.r_inner) / 2;
+          const outerR = (model.r_inner + model.r_max) / 2;
+          ctx.fillText("B" + (s + 1), cx + innerR * rx * Math.cos(angle), cy + innerR * ry * Math.sin(angle));
+          ctx.fillText("A" + (s + 1), cx + outerR * rx * Math.cos(angle), cy + outerR * ry * Math.sin(angle));
         }
       }
     }
@@ -418,8 +504,81 @@
     document.getElementById("chk-grid").checked = state.showGrid;
     document.getElementById("chk-labels").checked = state.showLabels;
     document.getElementById("in-server").value = state.server;
-    document.getElementById("hud-model").textContent =
-      "面板：" + state.panel.sectors + " 扇区 × 2 环 + 中心（17 传感器）";
+    const auto = document.getElementById("chk-auto");
+    const model = state.panel;
+    if (auto) auto.checked = Boolean(model.detected) && !state.manual;
+    for (const [key, id] of [
+      ["cx", "cx"],
+      ["cy", "cy"],
+      ["rx", "rx"],
+      ["ry", "ry"],
+    ]) {
+      const input = document.getElementById("in-" + id);
+      const output = document.getElementById("out-" + id);
+      if (input) input.value = String(model[key]);
+      if (output) output.textContent = (model[key] * 100).toFixed(1) + "%";
+    }
+    const hudModel = document.getElementById("hud-model");
+    if (hudModel) hudModel.textContent = panelSummary();
+  }
+
+  function bindSliders() {
+    let queued = false;
+    const apply = (key, value) => {
+      const model = Object.assign({}, state.panel, { [key]: value });
+      state.manual = true;
+      applyPanelLocal(model);
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => {
+        queued = false;
+        store.set("panel", state.panel);
+      });
+    };
+    for (const key of ["cx", "cy", "rx", "ry"]) {
+      const input = document.getElementById("in-" + key);
+      if (!input) continue;
+      input.addEventListener("input", () => apply(key, Number(input.value)));
+      input.addEventListener("change", () => syncPanel());
+    }
+    document.getElementById("chk-auto").addEventListener("change", (event) => {
+      state.manual = !event.target.checked;
+      store.set("manual", state.manual);
+      if (!state.manual) {
+        // hand control back: the PC keeps pushing the detected circle
+        store.set("panel", {});
+        send({ t: "panel-auto" });
+      }
+      syncPanel();
+    });
+    document.getElementById("btn-save-panel").addEventListener("click", async () => {
+      const model = state.panel;
+      const body = { cx: model.cx, cy: model.cy, rx: model.rx, ry: model.ry };
+      try {
+        const response = await fetch("http://" + state.server.replace(/^https?:\/\//, "") + "/api/panel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(Object.assign({ save: true }, body)),
+        });
+        const result = await response.json();
+        setBanner(result.ok ? "已保存到 PC" : "保存失败：" + (result.error || "?"));
+        if (result.ok) setTimeout(() => setBanner(null), 1200);
+      } catch (err) {
+        setBanner("保存失败：" + (err && err.message ? err.message : err));
+      }
+    });
+    document.getElementById("btn-reload-panel").addEventListener("click", async () => {
+      try {
+        const response = await fetch("http://" + state.server.replace(/^https?:\/\//, "") + "/api/panel");
+        applyPanel(await response.json());
+        state.manual = false;
+        store.set("panel", {});
+        store.set("manual", false);
+        syncPanel();
+      } catch (err) {
+        setBanner("读取失败：" + (err && err.message ? err.message : err));
+      }
+    });
   }
 
   function bindPanel() {
@@ -436,8 +595,11 @@
       store.set("showLabels", state.showLabels);
     });
     document.getElementById("btn-reset").addEventListener("click", () => {
-      state.panel = Object.assign({}, PANEL_DEFAULT);
-      store.set("panel", state.panel);
+      // back to whatever the PC detected (or the whole frame if nothing was found)
+      state.manual = false;
+      store.set("manual", false);
+      store.set("panel", {});
+      send({ t: "panel-auto" });
       syncPanel();
     });
     document.getElementById("btn-reconnect").addEventListener("click", () => {
@@ -489,6 +651,7 @@
   async function boot() {
     resizeCanvas();
     bindPanel();
+    bindSliders();
     syncPanel();
     countFrames();
     startFpsMeter();
