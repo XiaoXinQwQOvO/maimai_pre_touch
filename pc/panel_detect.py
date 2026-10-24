@@ -124,67 +124,173 @@ def _sample(mask: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
     return mask[yi, xi]
 
 
-def _ellipse_from_mask(filled: np.ndarray) -> tuple[float, float, float, float, float, float] | None:
-    """Fit an ellipse to the outline of a filled shape.
+def _fit_circle(xs: np.ndarray, ys: np.ndarray) -> tuple[float, float, float, float]:
+    """Algebraic (Kasa) circle fit: returns ``cx, cy, r, rms``."""
+    if len(xs) < 3:
+        return float("nan"), float("nan"), 0.0, 0.0
+    design = np.column_stack([xs, ys, np.ones_like(xs)])
+    target = xs * xs + ys * ys
+    try:
+        solution, *_ = np.linalg.lstsq(design, target, rcond=None)
+    except np.linalg.LinAlgError:
+        return float("nan"), float("nan"), 0.0, 0.0
+    cx = float(solution[0]) / 2.0
+    cy = float(solution[1]) / 2.0
+    radius = math.sqrt(max(1e-6, float(solution[2]) + cx * cx + cy * cy))
+    distances = np.hypot(xs - cx, ys - cy)
+    return cx, cy, radius, float(np.sqrt(np.mean((distances - radius) ** 2)))
 
-    Returns ``(cx, cy, rx, ry, angle_deg, inlier_ratio)``; the radii are already
-    mapped to screen axes when the ellipse is (nearly) axis aligned.  Points that do
-    not sit on the ellipse - frame clips, the neighbouring picture element the shape
-    merges with - are trimmed away and the fit is repeated.
+
+def _fit_circle_ransac(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    tolerance: float = 4.0,
+    iterations: int = 800,
+    seed: int = 12345,
+) -> tuple[float, float, float, np.ndarray] | None:
+    """Circle through a point cloud that is only partly on the circle.
+
+    The silhouette below the panel disc also contains the rest of the game's bright
+    graphics, so a plain least squares fit is dragged away; sample three points, count
+    inliers and refine the winner.
     """
-    import cv2
-
-    contours, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not contours:
+    count = len(xs)
+    if count < 20:
         return None
-    contour = max(contours, key=cv2.contourArea)
-    points = contour.reshape(-1, 2).astype(np.float64)
-    if len(points) < 20:
+    rng = np.random.default_rng(seed)
+    best: tuple[int, float, float, float] | None = None
+    best_mask = np.zeros(count, dtype=bool)
+    for _ in range(iterations):
+        pick = rng.choice(count, size=3, replace=False)
+        p0x, p0y = xs[pick[0]], ys[pick[0]]
+        x1, y1 = xs[pick[1]] - p0x, ys[pick[1]] - p0y
+        x2, y2 = xs[pick[2]] - p0x, ys[pick[2]] - p0y
+        determinant = 2.0 * (x1 * y2 - x2 * y1)
+        if abs(determinant) < 1e-6:
+            continue
+        ux = (y2 * (x1 * x1 + y1 * y1) - y1 * (x2 * x2 + y2 * y2)) / determinant
+        uy = (x1 * (x2 * x2 + y2 * y2) - x2 * (x1 * x1 + y1 * y1)) / determinant
+        cx, cy = p0x + ux, p0y + uy
+        radius = math.hypot(p0x - cx, p0y - cy)
+        if not (20.0 <= radius <= 400.0):
+            continue
+        distance = np.abs(np.hypot(xs - cx, ys - cy) - radius)
+        inliers = distance < tolerance
+        total = int(inliers.sum())
+        if best is None or total > best[0]:
+            best = (total, cx, cy, radius)
+            best_mask = inliers
+    if best is None or best[0] < 25:
         return None
-
-    total = len(points)
-    ellipse = cv2.fitEllipse(points.reshape(-1, 1, 2).astype(np.float32))
-    inliers = points
-    for _ in range(4):
-        (ex, ey), (d1, d2), angle = ellipse
-        if d1 <= 1.0 or d2 <= 1.0:
-            return None
-        radians = math.radians(angle)
-        cos_a, sin_a = math.cos(radians), math.sin(radians)
-        dx = inliers[:, 0] - ex
-        dy = inliers[:, 1] - ey
-        u = dx * cos_a + dy * sin_a
-        v = -dx * sin_a + dy * cos_a
-        distance = (u / (d1 / 2.0)) ** 2 + (v / (d2 / 2.0)) ** 2
-        keep = np.abs(distance - 1.0) < 0.35
-        if keep.sum() < 20:
+    cx, cy, radius, _rms = _fit_circle(xs[best_mask], ys[best_mask])
+    for _ in range(3):
+        distance = np.abs(np.hypot(xs - cx, ys - cy) - radius)
+        keep = distance < tolerance
+        if keep.sum() < 25:
             break
-        inliers = inliers[keep]
-        ellipse = cv2.fitEllipse(inliers.reshape(-1, 1, 2).astype(np.float32))
+        best_mask = keep
+        cx, cy, radius, _rms = _fit_circle(xs[keep], ys[keep])
+    return cx, cy, radius, best_mask
 
-    (ex, ey), (d1, d2), angle = ellipse
-    ratio = angle % 180.0
-    if min(ratio, 180.0 - ratio) <= 15.0:  # the d1 axis is horizontal
-        rx, ry = d1 / 2.0, d2 / 2.0
-    elif abs(ratio - 90.0) <= 15.0:  # the d1 axis is vertical
-        rx, ry = d2 / 2.0, d1 / 2.0
-    else:
-        # tilted ellipse: the touch mapping only knows screen axes, so keep the area
-        rx = ry = (d1 + d2) / 4.0
-    return ex, ey, rx, ry, angle, len(inliers) / total
+
+def _silhouette_arc(
+    mask: np.ndarray,
+    offset_x: int,
+    offset_y: int,
+    dark_level: float = 60.0,
+    gray=None,
+    frame_width: int = 0,
+) -> tuple[float, float, float, float | None] | None:
+    """Fit the panel disc's lower rim and measure its horizontal radius.
+
+    The disc sits at the bottom of the picture, so its lower rim is the one boundary that
+    reliably separates "inside the disc" from "background": the graphics drawn inside
+    (sector lines, labels) never touch it, and the game's other bright furniture is
+    trimmed away by the robust fit.
+
+    Returns ``(cx, pole_y, curvature, rx)`` in full frame pixels.  ``pole_y`` is the
+    bottom-most point of the rim, ``curvature`` the radius of the circle matching the rim
+    there (the real radius for a round picture, ``rx^2/ry`` for a stretched one) and
+    ``rx`` the measured horizontal radius, or ``None`` when no row of the disc borders on
+    darkness (the usual case in game).
+    """
+    rows_count, cols_count = mask.shape
+    xs: list[float] = []
+    ys: list[float] = []
+    for column in range(cols_count):
+        rows = np.nonzero(mask[:, column])[0]
+        if rows.size < 2:
+            continue
+        bottom = int(rows[-1])
+        if bottom < rows_count * 0.42:  # the disc's lower rim is in the bottom half
+            continue
+        xs.append(float(column + offset_x))
+        ys.append(float(bottom + offset_y))
+    if len(xs) < 30:
+        return None
+    fit = _fit_circle_ransac(np.array(xs), np.array(ys))
+    if fit is None:
+        return None
+    cx, cy, curvature, _inliers = fit
+    if curvature <= 20.0:
+        return None
+    pole_y = cy + curvature
+
+    # horizontal radius: the widest row whose rim borders on darkness (a crop edge only
+    # counts when it is the frame's own edge), kept only if it is centred on the disc
+    rx: float | None = None
+    if gray is not None:
+        centre_column = cx - offset_x
+        best_half = 0.0
+        for row in range(mask.shape[0]):
+            columns = np.nonzero(mask[row, :])[0]
+            if columns.size < 4:
+                continue
+            left = int(columns[0])
+            right = int(columns[-1])
+            left_inside = left - 3 >= 0
+            right_inside = right + 3 < cols_count
+            left_dark = left_inside and gray[row, left - 3] <= dark_level
+            right_dark = right_inside and gray[row, right + 3] <= dark_level
+            left_edge = not left_inside and left <= 1 and offset_x == 0
+            right_edge = (
+                not right_inside
+                and right >= cols_count - 2
+                and frame_width > 0
+                and offset_x + cols_count >= frame_width
+            )
+            if not (left_dark or right_dark or left_edge or right_edge):
+                continue
+            if left_dark and right_dark:
+                half = (right - left) / 2.0
+                middle = (left + right) / 2.0
+            elif right_dark or right_edge:
+                half = right - centre_column
+                middle = centre_column
+            else:
+                half = centre_column - left
+                middle = centre_column
+            if half <= 0.0 or abs(middle - centre_column) > 0.2 * curvature:
+                continue  # a one sided span that is not centred on the disc
+            best_half = max(best_half, half)
+        if best_half > 0.0 and 0.5 * curvature <= best_half <= 2.0 * curvature:
+            rx = best_half
+    return cx, pole_y, curvature, rx
 
 
 def detect_disc(
     frame_bgr: np.ndarray,
-    roi: tuple[float, float, float, float] = (0.0, 0.30, 0.55, 1.0),
+    roi: tuple[float, float, float, float] = (0.0, 0.24, 0.60, 1.0),
     threshold: float | None = None,
-    min_area_frac: float = 0.02,
+    min_coverage: float = 0.35,
 ) -> PanelCircle | None:
-    """Find the big bright disc/ring the game draws (the waiting-screen panel circle).
+    """Find the big bright disc the game draws on its waiting screen.
 
-    The shape is segmented by brightness, its holes are filled and an ellipse is fitted
-    to the outline, which gives the centre and the two radii even when the picture is
-    stretched.  Plausibility gates then reject convincing looking false positives.
+    The disc's lower rim is segmented by brightness and a circle is fitted to it with a
+    robust fit (the rest of the game's graphics in the same band would drag a plain least
+    squares fit away).  The vertical radius comes from that fit; the horizontal one is
+    measured when the disc's sides border on darkness, and a disagreement between the two
+    is reported as picture stretching.
     """
     import cv2
 
@@ -198,62 +304,59 @@ def detect_disc(
         otsu, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         threshold = max(float(otsu), 90.0)
     mask = (gray > threshold).astype(np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if count <= 1:
-        return None
-    best_index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    if stats[best_index, cv2.CC_STAT_AREA] < min_area_frac * crop.size:
-        return None
-    component = (labels == best_index).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8)).astype(bool)
 
-    # fill the holes (dark graphics drawn inside the circle) so the fit follows the rim
-    contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    filled = np.zeros_like(component)
-    cv2.drawContours(filled, contours, -1, 1, thickness=-1)
-
-    fit = _ellipse_from_mask(filled)
-    if fit is None:
+    arc = _silhouette_arc(mask, x0, y0, gray=gray, frame_width=width)
+    if arc is None:
         return None
-    cx, cy, rx, ry, _angle, inlier_ratio = fit
-    r = (rx + ry) / 2.0
-    if r <= 8.0:
-        return None
+    cx, pole_y, curvature, rx_measured = arc
 
-    theta = np.linspace(0.0, 2.0 * math.pi, 360, endpoint=False)
-    ring_x = np.rint(cx + rx * np.cos(theta)).astype(int)
-    ring_y = np.rint(cy + ry * np.sin(theta)).astype(int)
-    inside = (ring_x >= 0) & (ring_x < crop.shape[1]) & (ring_y >= 0) & (ring_y < crop.shape[0])
-    if int(inside.sum()) < 60:
-        return None
-    coverage = float(filled[ring_y[inside], ring_x[inside]].mean())
-
-    # plausibility gates: the panel circle is a big, round, well covered shape.
-    # Without them a busy desktop produces convincing looking false positives.
-    area = float(filled.sum())
-    filled_area = math.pi * rx * ry
-    area_ratio = area / filled_area if filled_area > 0 else 0.0
+    if rx_measured is not None and abs(rx_measured / curvature - 1.0) > 0.08:
+        # the horizontal extent disagrees with the rim's curvature: the picture is
+        # stretched, and for an ellipse ``curvature == rx^2 / ry`` at the bottom pole
+        rx = rx_measured
+        ry = rx * rx / curvature
+    else:
+        rx = rx_measured if rx_measured is not None else curvature
+        ry = curvature
     stretch = rx / ry if ry else 0.0
-    reasons = []
-    if coverage < 0.40:
-        reasons.append(f"coverage {coverage:.2f}")
-    if not (0.12 <= r / width <= 0.65):
-        reasons.append(f"radius {r / width:.3f} of the frame")
     if not (0.6 <= stretch <= 1.7):
-        reasons.append(f"stretch {stretch:.2f}")
-    if not (0.6 <= area_ratio <= 1.6):
-        reasons.append(f"area ratio {area_ratio:.2f}")
+        rx, ry = curvature, curvature
+        stretch = 1.0
+    cy = pole_y - ry
+    r = (rx + ry) / 2.0
+
+    # plausibility gates: big, in the lower left, round, and reasonably well covered
+    reasons = []
+    if not (0.12 <= r / width <= 0.50):
+        reasons.append(f"radius {r / width:.3f} of the frame")
+    if not (0.35 <= cy / height <= 1.05):
+        reasons.append(f"centre y {cy / height:.3f}")
+    if not (-0.15 <= cx / width <= 0.80):
+        reasons.append(f"centre x {cx / width:.3f}")
     if reasons:
         LOG.debug("panel: rejected a circle candidate (%s)", ", ".join(reasons))
         return None
 
+    # how much of the fitted rim really sits on the bright shape
+    theta = np.linspace(0.0, 2.0 * math.pi, 360, endpoint=False)
+    ring_x = np.rint(cx + rx * np.cos(theta) - x0).astype(int)
+    ring_y = np.rint(cy + ry * np.sin(theta) - y0).astype(int)
+    inside = (ring_x >= 0) & (ring_x < crop.shape[1]) & (ring_y >= 0) & (ring_y < crop.shape[0])
+    if int(inside.sum()) < 60:
+        return None
+    coverage = float(mask[ring_y[inside], ring_x[inside]].mean())
+    if coverage < min_coverage:
+        LOG.debug("panel: rejected a circle candidate (coverage %.2f)", coverage)
+        return None
+
     return PanelCircle(
-        cx=(cx + x0) / width,
-        cy=(cy + y0) / height,
+        cx=cx / width,
+        cy=cy / height,
         r=r / width,
-        score=coverage * 0.6 + min(1.0, inlier_ratio) * 0.4,
+        score=coverage,
         coverage=coverage,
-        sharpness=inlier_ratio,
+        sharpness=min(1.0, coverage / min_coverage) if min_coverage else 1.0,
         rx=rx / width,
         ry=ry / height,
     )

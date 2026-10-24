@@ -316,6 +316,7 @@
   }
 
   function onPointerDown(event) {
+    if (adjust.active) return adjustDown(event);
     if (panel && !panel.classList.contains("hidden")) return;
     if (event.target.closest && event.target.closest("#btn-panel")) return;
     event.preventDefault();
@@ -334,6 +335,7 @@
   }
 
   function onPointerMove(event) {
+    if (adjust.active) return adjustMove(event);
     const contact = state.contacts.get(event.pointerId);
     if (!contact) return;
     event.preventDefault();
@@ -348,12 +350,83 @@
   }
 
   function onPointerUp(event) {
+    if (adjust.active) return adjustUp(event);
     const contact = state.contacts.get(event.pointerId);
     if (!contact) return;
     event.preventDefault();
     emitTouch(contact, "up");
     state.contacts.delete(event.pointerId);
     hudZone.textContent = "—";
+  }
+
+  // ------------------------------------------------- ring adjustment mode
+  // Drag on the picture to move the ring, pinch (two fingers) to resize it.  No touch
+  // is sent to the game while adjusting, so a wrong ring never presses anything.
+  const adjust = { active: false, points: new Map(), snapshot: null, startPoints: null };
+
+  function setAdjust(on) {
+    adjust.active = Boolean(on);
+    adjust.points = new Map();
+    adjust.snapshot = null;
+    adjust.startPoints = null;
+    document.body.classList.toggle("adjusting", adjust.active);
+    setBanner(adjust.active ? "拖动移动圆环、双指缩放，对齐后点「保存到 PC」" : null);
+  }
+
+  function adjustDown(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    stage.setPointerCapture(event.pointerId);
+    adjust.points.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (!adjust.snapshot) {
+      adjust.snapshot = Object.assign({}, state.panel);
+      adjust.startPoints = new Map(adjust.points);
+    }
+  }
+
+  function adjustMove(event) {
+    if (!adjust.points.has(event.pointerId)) return;
+    event.preventDefault();
+    adjust.points.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const snap = adjust.snapshot;
+    if (!snap) return;
+    const box = contentBox();
+    const start = Array.from(adjust.startPoints.values());
+    const now = Array.from(adjust.points.values());
+    let next;
+    if (start.length >= 2 && now.length >= 2) {
+      const d0 = Math.hypot(start[0].x - start[1].x, start[0].y - start[1].y);
+      const d1 = Math.hypot(now[0].x - now[1].x, now[0].y - now[1].y);
+      const scale = d0 > 8 ? d1 / d0 : 1;
+      const m0 = { x: (start[0].x + start[1].x) / 2, y: (start[0].y + start[1].y) / 2 };
+      const m1 = { x: (now[0].x + now[1].x) / 2, y: (now[0].y + now[1].y) / 2 };
+      next = {
+        cx: snap.cx + (m1.x - m0.x) / box.w,
+        cy: snap.cy + (m1.y - m0.y) / box.h,
+        rx: snap.rx * scale,
+        ry: snap.ry * scale,
+      };
+    } else {
+      next = {
+        cx: snap.cx + (now[0].x - start[0].x) / box.w,
+        cy: snap.cy + (now[0].y - start[0].y) / box.h,
+        rx: snap.rx,
+        ry: snap.ry,
+      };
+    }
+    next.rx = Math.min(1.5, Math.max(0.02, next.rx));
+    next.ry = Math.min(1.5, Math.max(0.02, next.ry));
+    state.manual = true;
+    applyPanelLocal(Object.assign({}, state.panel, next));
+  }
+
+  function adjustUp(event) {
+    if (adjust.points.has(event.pointerId)) adjust.points.delete(event.pointerId);
+    if (adjust.points.size === 0) {
+      if (adjust.snapshot) store.set("panel", state.panel);
+      adjust.snapshot = null;
+      adjust.startPoints = null;
+    }
   }
 
   stage.addEventListener("pointerdown", onPointerDown, { passive: false });
@@ -550,6 +623,12 @@
         send({ t: "panel-auto" });
       }
       syncPanel();
+    });
+    document.getElementById("chk-adjust").addEventListener("change", (event) => {
+      setAdjust(event.target.checked);
+      if (adjust.active) {
+        document.getElementById("panel").classList.add("hidden");
+      }
     });
     document.getElementById("btn-save-panel").addEventListener("click", async () => {
       const model = state.panel;
