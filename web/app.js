@@ -219,6 +219,13 @@
       case "panel":
         applyPanel(msg);
         break;
+      case "busy":
+        // another device holds the stream: one track feeds one sender, so letting both
+        // in would halve the frame rate for each
+        setBanner("另一台设备正在串流，30 秒后重试");
+        stopPeer();
+        setTimeout(() => scheduleReconnect("上一台设备占用了串流"), 30000);
+        break;
       case "answer":
         if (state.pc && msg.sdp) {
           await state.pc.setRemoteDescription({ type: msg.type || "answer", sdp: msg.sdp });

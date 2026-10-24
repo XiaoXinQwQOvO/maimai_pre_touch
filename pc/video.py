@@ -30,6 +30,16 @@ INPUT_FORMAT = "yuv420p"
 #: not enough for this game's 960x960@60 picture, so the target lives here instead and
 #: the encoders read it.  ``remb`` only records what the receiver suggests (aiortc's
 #: sender writes it) for diagnostics; the target is steered by the phone's own reports.
+#: Frames per second the encoder should budget for.  aiortc's MAX_FRAME_RATE is 30, and
+#: NVENC sizes each frame as bitrate/framerate - so with the wrong value here every
+#: stream ran at twice the bitrate that was configured.
+FRAME_RATE = {"fps": 60}
+
+
+def set_frame_rate(fps: int) -> None:
+    FRAME_RATE["fps"] = max(1, int(fps))
+
+
 BITRATE = {
     "target": 8_000_000,
     "min": 1_500_000,
@@ -99,6 +109,7 @@ class H264NvencEncoder(H264Encoder):
         if self.codec and (
             frame.width != self.codec.width
             or frame.height != self.codec.height
+            or int(FRAME_RATE["fps"]) != int(self.codec.framerate or 0)
             or abs(self.target_bitrate - self.codec.bit_rate) / max(1, self.codec.bit_rate or 1) > 0.1
         ):
             self.buffer_data = b""
@@ -116,8 +127,9 @@ class H264NvencEncoder(H264Encoder):
             codec.height = frame.height
             codec.bit_rate = self.target_bitrate
             codec.pix_fmt = self.PIX_FMT
-            codec.framerate = fractions.Fraction(MAX_FRAME_RATE, 1)
-            codec.time_base = fractions.Fraction(1, MAX_FRAME_RATE)
+            fps = int(FRAME_RATE["fps"])
+            codec.framerate = fractions.Fraction(fps, 1)
+            codec.time_base = fractions.Fraction(1, fps)
             codec.options = dict(self.OPTIONS)
             try:
                 codec.profile = "baseline"

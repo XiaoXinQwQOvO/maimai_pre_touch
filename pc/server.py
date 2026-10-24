@@ -264,44 +264,6 @@ class GameState:
             "rtt_ms": number("rtt"),
         }
 
-    def _adapt_bitrate(self) -> None:
-        """Follow the phone's own measurements, like Sunshine's adaptive bitrate.
-
-        The encoder target starts at the configured maximum; a clean link is probed
-        upwards slowly and a dirty one is backed off quickly, so the picture keeps
-        its resolution and the latency stays bounded.
-        """
-        stats = self.state.rx_stats or {}
-        fps = stats.get("fps") or 0
-        loss = stats.get("loss_pct")
-        jitter = stats.get("jitter_ms") or 0
-        rtt = stats.get("rtt_ms") or 0
-        now = time.time()
-        if now - self._bitrate_change_at < 2.0:
-            return
-        current = video_mod.stream_bitrate_kbps()
-        clean = (loss is None or loss < 0.5) and jitter < 30 and rtt < 80 and fps >= 50
-        bad = (loss or 0) > 1.0 or jitter > 80 or rtt > 200 or fps < 40
-        if clean:
-            target = min(current * 1.2 + 250, self.bitrate_max)
-        elif bad:
-            target = max(current * 0.7, self.bitrate_min)
-        else:
-            return
-        if abs(target - current) <= 0.05 * max(1.0, current):
-            return
-        applied = video_mod.set_stream_bitrate(target)
-        self._bitrate_change_at = now
-        log.info(
-            "video: bitrate %d -> %d kbps (phone: %s fps, loss %s%%, jitter %sms, rtt %sms)",
-            int(current),
-            applied // 1000,
-            fps,
-            loss,
-            jitter,
-            rtt,
-        )
-
     def set_phone_count(self, count: int) -> None:
         """Tell the touch backend whether somebody is playing through the phone."""
         setter = getattr(self.touch, "set_connected", None)
@@ -322,15 +284,23 @@ class App:
         self.peers: set = set()
         self.clients = 0
         video_cfg = cfg.get("video", {})
+        video_mod.set_frame_rate(int(video_cfg.get("fps", 60)))
         video_mod.set_bitrate_limits(
-            max_kbps=int(video_cfg.get("bitrate_kbps", 12000)),
+            max_kbps=int(video_cfg.get("bitrate_kbps", 16000)),
             min_kbps=video_cfg.get("min_bitrate_kbps"),
+            # start where the link actually works instead of at the ceiling: a fresh
+            # 16 Mbps burst makes the receiver drop a third of the packets until the
+            # controller backs off again
+            start_kbps=int(video_cfg.get("start_bitrate_kbps", 8000)),
         )
         self.bitrate_max = int(video_cfg.get("bitrate_kbps", 12000))
         self.bitrate_min = int(
             video_cfg.get("min_bitrate_kbps") or max(1500, self.bitrate_max // 4)
         )
         self._bitrate_change_at = 0.0
+        self._bitrate_ceiling = float(self.bitrate_max)
+        self._viewer = None  # {'request':..., 'since':..., 'seen':...}
+        self._bitrate_ceiling_at = 0.0
         self.video_track = GameVideoTrack(
             state.capture,
             fps=int(video_cfg.get("fps", 60)),
@@ -343,6 +313,61 @@ class App:
 
     async def index(self, request: web.Request):
         return web.FileResponse(os.path.join(WEB_DIR, "index.html"))
+
+    def _adapt_bitrate(self) -> None:
+        """Follow the phone's own measurements, like Sunshine's adaptive bitrate.
+
+        The encoder target starts at the configured maximum; a clean link is probed
+        upwards slowly and a dirty one is backed off quickly, so the picture keeps
+        its resolution and the latency stays bounded.
+        """
+        stats = self.state.rx_stats or {}
+        if not stats:
+            return
+        fps = stats.get("fps")
+        loss = stats.get("loss_pct")
+        jitter = stats.get("jitter_ms") or 0
+        rtt = stats.get("rtt_ms") or 0
+        now = time.time()
+        if now - self._bitrate_change_at < 2.0:
+            return
+        current = video_mod.stream_bitrate_kbps()
+        # a reported 0/missing fps usually just means the peer was reconnecting, so the
+        # frame rate only counts when it is a real number
+        fps_known = isinstance(fps, (int, float)) and fps > 0
+        clean = (
+            (loss is None or loss < 0.5)
+            and jitter < 30
+            and rtt < 80
+            and (not fps_known or fps >= 50)
+        )
+        bad = (loss or 0) > 1.0 or jitter > 80 or rtt > 200 or (fps_known and fps < 40)
+        if clean:
+            # probe upwards gently, but never above the level that last caused loss
+            if now - self._bitrate_ceiling_at > 60.0:
+                self._bitrate_ceiling = min(self.bitrate_max, self._bitrate_ceiling * 1.1)
+                self._bitrate_ceiling_at = now
+            target = min(current * 1.08 + 150, self._bitrate_ceiling)
+        elif bad:
+            target = max(current * 0.7, self.bitrate_min)
+            self._bitrate_ceiling = max(float(self.bitrate_min), current * 0.9)
+            self._bitrate_ceiling_at = now
+        else:
+            return
+        if abs(target - current) <= 0.05 * max(1.0, current):
+            return
+        applied = video_mod.set_stream_bitrate(target)
+        self._bitrate_change_at = now
+        log.info(
+            "video: bitrate %d -> %d kbps (phone: %s fps, loss %s%%, jitter %sms, rtt %sms)",
+            int(current),
+            applied // 1000,
+            fps,
+            loss,
+            jitter,
+            rtt,
+        )
+
 
     async def status(self, request: web.Request):
         payload = {
@@ -474,6 +499,32 @@ class App:
                     elif kind == "offer":
                         if peer is not None:
                             await peer.close()
+                        # One track feeds one sender: a second peer connection would take
+                        # every other frame, so both viewers would see ~30 fps.  Whoever
+                        # is already streaming therefore keeps the stream; a second device
+                        # is told it is busy instead of silently halving both.
+                        viewer = self._viewer
+                        if (
+                            viewer is not None
+                            and viewer["request"] is not request
+                            and time.time() - viewer["seen"] < 6.0
+                        ):
+                            log.info(
+                                "refusing a second video viewer (%s is already streaming)",
+                                viewer.get("remote"),
+                            )
+                            await send({"t": "busy", "reason": "another device is streaming"})
+                            continue
+                        for stale in list(self.peers):
+                            if stale is peer:
+                                continue
+                            try:
+                                await stale.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            self.peers.discard(stale)
+                            log.info("closed the previous video viewer")
+                        self._viewer = {"request": request, "since": time.time(), "seen": time.time(), "remote": request.remote}
                         peer = RTCPeerConnection()
                         self.peers.add(peer)
                         self.state.set_phone_count(len(self.peers))
@@ -519,9 +570,11 @@ class App:
                         self.state.panel_watcher.set_manual(None)
                     elif kind == "stats":
                         await send({"t": "stats", "video": self.video_track.stats, "game": self.state.status()})
-                    elif kind == "rx-stats":
+                    elif kind == "rx-stats" and (self._viewer is None or self._viewer["request"] is request):
                         # what the phone says it receives/decodes - the only place the
                         # link quality is visible from this side
+                        if self._viewer is not None:
+                            self._viewer["seen"] = time.time()
                         self.state.set_rx_stats(data)
                         self._adapt_bitrate()
                         log.info(
