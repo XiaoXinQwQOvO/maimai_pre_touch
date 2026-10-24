@@ -40,6 +40,15 @@ def set_frame_rate(fps: int) -> None:
     FRAME_RATE["fps"] = max(1, int(fps))
 
 
+#: Whether the bitrate may follow the phone's reports.  Off by default: every change
+#: costs a hiccup, and a stable bitrate is worth more than a perfectly sized one.
+ADAPTIVE = {"on": False}
+
+
+def set_adaptive(on: bool) -> None:
+    ADAPTIVE["on"] = bool(on)
+
+
 BITRATE = {
     "target": 8_000_000,
     "min": 1_500_000,
@@ -101,22 +110,28 @@ class H264NvencEncoder(H264Encoder):
         "zerolatency": "1",
         "rc-lookahead": "0",
         "bf": "0",
-        # a longer GOP means fewer (expensive) keyframes per second on a weak link
-        "g": "120",
+        # short GOP: after a lost packet the decoder waits for the next keyframe, so a
+        # long one is exactly what makes the picture "freeze"
+        "g": "60",
     }
 
     def _encode_frame(self, frame: av.VideoFrame, force_keyframe: bool):
+        rebuilt = False
         if self.codec and (
             frame.width != self.codec.width
             or frame.height != self.codec.height
             or int(FRAME_RATE["fps"]) != int(self.codec.framerate or 0)
-            or abs(self.target_bitrate - self.codec.bit_rate) / max(1, self.codec.bit_rate or 1) > 0.1
+            # recreating the encoder mid-stream costs a keyframe and a visible hiccup, so
+            # only do it for a big change
+            or abs(self.target_bitrate - self.codec.bit_rate) / max(1, self.codec.bit_rate or 1) > 0.4
         ):
             self.buffer_data = b""
             self.buffer_pts = None
             self.codec = None
+            rebuilt = True
+            log.debug("video: encoder rebuilt (target %d kbps)", self.target_bitrate // 1000)
 
-        if force_keyframe:
+        if force_keyframe or rebuilt:
             frame.pict_type = av.video.frame.PictureType.I
         else:
             frame.pict_type = av.video.frame.PictureType.NONE

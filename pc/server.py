@@ -284,7 +284,8 @@ class App:
         self.peers: set = set()
         self.clients = 0
         video_cfg = cfg.get("video", {})
-        video_mod.set_frame_rate(int(video_cfg.get("fps", 60)))
+        video_mod.set_frame_rate(int(video_cfg.get("fps", 120)))
+        video_mod.set_adaptive(bool(video_cfg.get("adaptive", False)))
         video_mod.set_bitrate_limits(
             max_kbps=int(video_cfg.get("bitrate_kbps", 16000)),
             min_kbps=video_cfg.get("min_bitrate_kbps"),
@@ -321,6 +322,8 @@ class App:
         upwards slowly and a dirty one is backed off quickly, so the picture keeps
         its resolution and the latency stays bounded.
         """
+        if not video_mod.ADAPTIVE["on"]:
+            return
         stats = self.state.rx_stats or {}
         if not stats:
             return

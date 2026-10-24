@@ -6,7 +6,7 @@
   "capture": {
     "backend": "dxcam",
     "output_idx": 0,
-    "fps": 60,
+    "fps": 120,
     "follow_window": true,
     "process_names": [
       "maimai_dump_.exe",
@@ -17,11 +17,10 @@
   },
   "video": {
     "encoder": "auto",
-    "bitrate_kbps": 16000,
-    "fps": 60,
+    "bitrate_kbps": 6000,
+    "fps": 120,
     "scale": 1.0,
-    "min_bitrate_kbps": 3000,
-    "start_bitrate_kbps": 8000
+    "adaptive": false
   },
   "touch": {
     "backend": "maitouch",
