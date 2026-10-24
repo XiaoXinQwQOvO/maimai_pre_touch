@@ -328,11 +328,14 @@ def detect_disc(
 
     # plausibility gates: big, in the lower left, round, and reasonably well covered
     reasons = []
-    if not (0.12 <= r / width <= 0.50):
+    if not (0.20 <= r / width <= 0.29):
         reasons.append(f"radius {r / width:.3f} of the frame")
-    if not (0.55 <= cy / height <= 1.00):
+    if not (0.68 <= cy / height <= 0.86):
         reasons.append(f"centre y {cy / height:.3f}")
-    if not (0.05 <= cx / width <= 0.45):
+    # this game draws the panel disc at a fixed place in its (always square) picture:
+    # centre about (0.25, 0.76) with a radius of about 0.24.  Everything else that looks
+    # like a disc during play is a false positive that would garble every touch.
+    if not (0.19 <= cx / width <= 0.31):
         reasons.append(f"centre x {cx / width:.3f}")
     if reasons:
         LOG.debug("panel: rejected a circle candidate (%s)", ", ".join(reasons))

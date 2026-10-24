@@ -26,12 +26,63 @@ log = logging.getLogger(__name__)
 #: doing the swscale conversion in Python.
 INPUT_FORMAT = "yuv420p"
 
+#: Bitrate control.  aiortc's own H264Encoder clamps target_bitrate to 3 Mbps, which is
+#: not enough for this game's 960x960@60 picture, so the target lives here instead and
+#: the encoders read it.  ``remb`` only records what the receiver suggests (aiortc's
+#: sender writes it) for diagnostics; the target is steered by the phone's own reports.
+BITRATE = {
+    "target": 8_000_000,
+    "min": 1_500_000,
+    "max": 12_000_000,
+    "remb": None,
+}
+_LIVE_ENCODERS: list = []
+
+
+def set_bitrate_limits(max_kbps: int, min_kbps: int | None = None, start_kbps: int | None = None) -> None:
+    """Configure the range the controller may use (kbps)."""
+    BITRATE["max"] = int(max_kbps) * 1000
+    BITRATE["min"] = int(min_kbps if min_kbps else max(800, max_kbps // 6)) * 1000
+    target = int(start_kbps) * 1000 if start_kbps else BITRATE["max"]
+    BITRATE["target"] = max(BITRATE["min"], min(target, BITRATE["max"]))
+    log.info(
+        "video: bitrate range %d-%d kbps (target %d kbps)",
+        BITRATE["min"] // 1000,
+        BITRATE["max"] // 1000,
+        BITRATE["target"] // 1000,
+    )
+
+
+def set_stream_bitrate(kbps: float) -> int:
+    """Set the encoder target (kbps); returns the value actually applied."""
+    target = int(max(BITRATE["min"], min(float(kbps) * 1000, BITRATE["max"])))
+    BITRATE["target"] = target
+    return target
+
+
+def stream_bitrate_kbps() -> float:
+    return round(BITRATE["target"] / 1000.0, 1)
+
 
 class H264NvencEncoder(H264Encoder):
     """H.264 encoder backed by NVENC with ultra-low-latency settings."""
 
     CODEC_NAME = "h264_nvenc"
     PIX_FMT = INPUT_FORMAT
+
+    def __init__(self) -> None:
+        super().__init__()
+        _LIVE_ENCODERS.append(self)
+
+    @property
+    def target_bitrate(self) -> int:
+        return int(BITRATE["target"])
+
+    @target_bitrate.setter
+    def target_bitrate(self, bitrate: int) -> None:
+        # aiortc's sender writes the receiver's REMB estimate here; remember it (the
+        # phone's own statistics drive the target) instead of obeying a 3 Mbps clamp
+        BITRATE["remb"] = int(bitrate)
     OPTIONS = {
         "preset": "p1",
         "tune": "ull",
@@ -233,6 +284,8 @@ class GameVideoTrack(VideoStreamTrack):
         elapsed = max(1e-6, time.time() - self._started)
         timings = {k: (round(sum(v) / len(v), 2) if v else None) for k, v in self._times.items()}
         return {
+            "bitrate_kbps": stream_bitrate_kbps(),
+            "remb_kbps": None if BITRATE["remb"] is None else round(BITRATE["remb"] / 1000.0, 1),
             "frames_sent": self._frames_sent,
             "fps": round(self._frames_sent / elapsed, 1),
             "last_frame_age": round(time.time() - self._pending_at, 3) if self._pending_at else None,

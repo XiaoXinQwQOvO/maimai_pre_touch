@@ -27,6 +27,7 @@ import window as window_mod  # noqa: E402
 import sensors  # noqa: E402
 from capture import CaptureManager  # noqa: E402
 from touch_backends import create_backend  # noqa: E402
+import video as video_mod  # noqa: E402
 from video import GameVideoTrack, install_encoder  # noqa: E402
 
 log = logging.getLogger("server")
@@ -255,6 +256,44 @@ class GameState:
             "rtt_ms": number("rtt"),
         }
 
+    def _adapt_bitrate(self) -> None:
+        """Follow the phone's own measurements, like Sunshine's adaptive bitrate.
+
+        The encoder target starts at the configured maximum; a clean link is probed
+        upwards slowly and a dirty one is backed off quickly, so the picture keeps
+        its resolution and the latency stays bounded.
+        """
+        stats = self.state.rx_stats or {}
+        fps = stats.get("fps") or 0
+        loss = stats.get("loss_pct")
+        jitter = stats.get("jitter_ms") or 0
+        rtt = stats.get("rtt_ms") or 0
+        now = time.time()
+        if now - self._bitrate_change_at < 2.0:
+            return
+        current = video_mod.stream_bitrate_kbps()
+        clean = (loss is None or loss < 0.5) and jitter < 30 and rtt < 80 and fps >= 50
+        bad = (loss or 0) > 1.0 or jitter > 80 or rtt > 200 or fps < 40
+        if clean:
+            target = min(current * 1.2 + 250, self.bitrate_max)
+        elif bad:
+            target = max(current * 0.7, self.bitrate_min)
+        else:
+            return
+        if abs(target - current) <= 0.05 * max(1.0, current):
+            return
+        applied = video_mod.set_stream_bitrate(target)
+        self._bitrate_change_at = now
+        log.info(
+            "video: bitrate %d -> %d kbps (phone: %s fps, loss %s%%, jitter %sms, rtt %sms)",
+            int(current),
+            applied // 1000,
+            fps,
+            loss,
+            jitter,
+            rtt,
+        )
+
     def set_phone_count(self, count: int) -> None:
         """Tell the touch backend whether somebody is playing through the phone."""
         setter = getattr(self.touch, "set_connected", None)
@@ -275,6 +314,15 @@ class App:
         self.peers: set = set()
         self.clients = 0
         video_cfg = cfg.get("video", {})
+        video_mod.set_bitrate_limits(
+            max_kbps=int(video_cfg.get("bitrate_kbps", 12000)),
+            min_kbps=video_cfg.get("min_bitrate_kbps"),
+        )
+        self.bitrate_max = int(video_cfg.get("bitrate_kbps", 12000))
+        self.bitrate_min = int(
+            video_cfg.get("min_bitrate_kbps") or max(1500, self.bitrate_max // 4)
+        )
+        self._bitrate_change_at = 0.0
         self.video_track = GameVideoTrack(
             state.capture,
             fps=int(video_cfg.get("fps", 60)),
@@ -467,6 +515,7 @@ class App:
                         # what the phone says it receives/decodes - the only place the
                         # link quality is visible from this side
                         self.state.set_rx_stats(data)
+                        self._adapt_bitrate()
                         log.info(
                             "phone: %s fps, %s kbps, jitter %s ms, loss %s %%, rtt %s ms",
                             data.get("fps"),
