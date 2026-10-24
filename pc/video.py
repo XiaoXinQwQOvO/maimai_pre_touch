@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import fractions
 import logging
+import threading
 import time
 
 import av
+import numpy as np
 from aiortc import VideoStreamTrack
 from aiortc.codecs.h264 import MAX_FRAME_RATE, H264Encoder
 from aiortc.mediastreams import VIDEO_CLOCK_RATE, VIDEO_TIME_BASE
@@ -35,6 +37,11 @@ class H264NvencEncoder(H264Encoder):
         "tune": "ull",
         "rc": "cbr",
         "delay": "0",
+        "zerolatency": "1",
+        "rc-lookahead": "0",
+        "bf": "0",
+        # a longer GOP means fewer (expensive) keyframes per second on a weak link
+        "g": "120",
     }
 
     def _encode_frame(self, frame: av.VideoFrame, force_keyframe: bool):
@@ -126,27 +133,95 @@ def install_encoder(choice: str = "auto") -> str:
 
 
 class GameVideoTrack(VideoStreamTrack):
-    """Pulls the latest captured frame and turns it into a video track."""
+    """Sends the game's picture at a rock-steady frame rate.
+
+    Capturing and sending run on separate threads: a pump thread keeps the newest frame
+    (already scaled and converted to the encoder's pixel format) and ``recv`` hands out
+    whatever is current every 1/fps seconds.  Waiting for a fresh capture inside ``recv``
+    instead used to make the stream skip a frame whenever one encode took slightly longer
+    than the frame interval - that is what dropped this machine from 60 to ~50 fps - and
+    it also added the capture jitter to every frame's latency.
+    """
 
     kind = "video"
 
-    def __init__(self, capture_manager, fps: int = 60, scale: float = 1.0, bitrate_kbps: int = 9000):
+    def __init__(
+        self, capture_manager, fps: int = 60, scale: float = 1.0, bitrate_kbps: int = 9000
+    ):
         super().__init__()
         self._capture = capture_manager
         self._fps = max(1, int(fps))
         self._scale = float(scale)
-        self._last_frame = None
+        self._pending: av.VideoFrame | None = None
+        self._pending_at = 0.0
+        self._pending_lock = threading.Lock()
+        self._pump_stop = threading.Event()
         self._frames_sent = 0
         self._started = time.time()
-        self._times = {"grab": [], "convert": [], "pace": [], "total": []}
+        self._times = {
+            "grab": [],  # how long the pump waited for a new capture
+            "convert": [],  # scale + pixel format conversion, in the pump
+            "pace": [],  # the send loop's own sleep
+            "total": [],  # the send loop's duration
+            "period": [],  # the send loop's period
+            "age": [],  # age of the frame being sent
+        }
         self._t0 = None
         self._timestamp = 0
+        self._last_period_start = None
         self._resize = None
         if abs(self._scale - 1.0) > 1e-3:
             import cv2
 
             self._resize = cv2
+        self._pump = threading.Thread(target=self._pump_loop, name="video-pump", daemon=True)
+        self._pump.start()
 
+    # -- capture side -------------------------------------------------------
+    def _pump_loop(self) -> None:
+        blank_size = None
+        while not self._pump_stop.is_set():
+            t_grab = time.perf_counter()
+            try:
+                array = self._capture.get_frame()
+            except Exception as exc:  # noqa: BLE001 - never kill the pump
+                log.warning("video: capture failed: %s", exc)
+                array = None
+            self._record("grab", time.perf_counter() - t_grab)
+            if array is None:
+                self._pump_stop.wait(0.002)
+                continue
+            t_conv = time.perf_counter()
+            try:
+                if self._resize is not None:
+                    array = self._resize.resize(
+                        array,
+                        None,
+                        fx=self._scale,
+                        fy=self._scale,
+                        interpolation=self._resize.INTER_LINEAR,
+                    )
+                frame = av.VideoFrame.from_ndarray(array, format="bgra")
+                if INPUT_FORMAT != "bgra":
+                    frame = frame.reformat(format=INPUT_FORMAT)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("video: frame conversion failed: %s", exc)
+                continue
+            self._record("convert", time.perf_counter() - t_conv)
+            blank_size = (frame.width, frame.height)
+            with self._pending_lock:
+                self._pending = frame
+                self._pending_at = time.time()
+
+    def _blank_frame(self) -> av.VideoFrame:
+        side = max(2, int(round(960 * self._scale)))
+        empty = np.zeros((side, side, 4), dtype="uint8")
+        frame = av.VideoFrame.from_ndarray(empty, format="bgra")
+        if INPUT_FORMAT != "bgra":
+            frame = frame.reformat(format=INPUT_FORMAT)
+        return frame
+
+    # -- send side ----------------------------------------------------------
     def _record(self, key: str, seconds: float) -> None:
         samples = self._times[key]
         samples.append(seconds * 1000.0)
@@ -160,9 +235,13 @@ class GameVideoTrack(VideoStreamTrack):
         return {
             "frames_sent": self._frames_sent,
             "fps": round(self._frames_sent / elapsed, 1),
-            "last_frame_age": round(time.time() - self._capture.last_frame_time, 3) if self._capture.last_frame_time else None,
+            "last_frame_age": round(time.time() - self._pending_at, 3) if self._pending_at else None,
             "avg_ms": timings,
         }
+
+    def stop(self) -> None:
+        self._pump_stop.set()
+        super().stop()
 
     async def recv(self):
         # aiortc's MediaStreamTrack.next_timestamp() hardcodes 30 fps
@@ -175,37 +254,26 @@ class GameVideoTrack(VideoStreamTrack):
         else:
             self._timestamp += int(VIDEO_CLOCK_RATE / self._fps)
             due = self._t0 + self._timestamp / VIDEO_CLOCK_RATE
-            if due - now > -1.0:
+            if due - now > -0.5:
                 if due > now:
                     await asyncio.sleep(due - now)
             else:  # fell far behind (e.g. after a stall) - resync instead of bursting
                 self._t0 = now - self._timestamp / VIDEO_CLOCK_RATE
         self._record("pace", time.perf_counter() - t_start)
-        pts = self._timestamp
-        time_base = VIDEO_TIME_BASE
 
-        t_grab = time.perf_counter()
-        # get_latest_frame() waits for the next DXGI frame (up to ~16 ms); keep it
-        # off the event loop so touch/signalling messages are not delayed.
-        array = await asyncio.to_thread(self._capture.get_frame)
-        self._record("grab", time.perf_counter() - t_grab)
-        if array is not None:
-            self._last_frame = array
-        elif self._last_frame is None:
-            import numpy as np
+        with self._pending_lock:
+            frame = self._pending
+            age = time.time() - self._pending_at if self._pending_at else None
+        if age is not None:
+            self._record("age", age)
+        if frame is None:
+            frame = self._blank_frame()
 
-            self._last_frame = np.zeros((960, 960, 4), dtype="uint8")
-        frame_array = self._last_frame
-
-        t_conv = time.perf_counter()
-        if self._resize is not None and frame_array is not None:
-            frame_array = self._resize.resize(frame_array, None, fx=self._scale, fy=self._scale, interpolation=self._resize.INTER_LINEAR)
-        frame = av.VideoFrame.from_ndarray(frame_array, format="bgra")
-        if INPUT_FORMAT != "bgra":
-            frame = frame.reformat(format=INPUT_FORMAT)
-        frame.pts = pts
-        frame.time_base = time_base
-        self._record("convert", time.perf_counter() - t_conv)
+        frame.pts = self._timestamp
+        frame.time_base = VIDEO_TIME_BASE
         self._record("total", time.perf_counter() - t_start)
+        if self._last_period_start:
+            self._record("period", t_start - self._last_period_start)
+        self._last_period_start = t_start
         self._frames_sent += 1
         return frame

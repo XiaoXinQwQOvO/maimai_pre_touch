@@ -255,11 +255,94 @@
     });
   }
 
+  // The receiver's jitter buffer is what makes the picture lag behind reality: Chrome
+  // starts at ~200 ms and only grows when packets are late.  Ask for the minimum.
+  function tuneReceiver(pc) {
+    if (!pc || !pc.getReceivers) return;
+    try {
+      pc.getReceivers().forEach((rx) => {
+        if (!rx) return;
+        if ("jitterBufferTarget" in rx) rx.jitterBufferTarget = 0;
+        if ("playoutDelayHint" in rx) rx.playoutDelayHint = 0;
+      });
+    } catch (_) {}
+  }
+
+  // Live numbers from the receive side: what the phone actually decodes, plus the
+  // bitrate/loss/RTT of the link - so "卡" can be told apart from "网络差".
+  let statsTimer = null;
+  let lastStats = null;
+  function startVideoStats() {
+    stopVideoStats();
+    lastStats = null;
+    statsTimer = setInterval(async () => {
+      const pc = state.pc;
+      if (!pc || !pc.getStats) return;
+      let report;
+      try {
+        report = await pc.getStats();
+      } catch (_) {
+        return;
+      }
+      const now = performance.now();
+      let fps = null;
+      let kbps = null;
+      let jitterMs = null;
+      let lostPct = null;
+      let rttMs = null;
+      report.forEach((s) => {
+        if (s.type === "inbound-rtp" && (s.kind === "video" || s.mediaType === "video")) {
+          if (typeof s.framesPerSecond === "number") fps = s.framesPerSecond;
+          if (typeof s.jitter === "number") jitterMs = s.jitter * 1000;
+          if (typeof s.packetsReceived === "number" && typeof s.packetsLost === "number") {
+            const total = s.packetsReceived + s.packetsLost;
+            if (total > 0) lostPct = (s.packetsLost / total) * 100;
+          }
+          if (lastStats && typeof s.bytesReceived === "number") {
+            const dt = (now - lastStats.at) / 1000;
+            if (dt > 0.2) kbps = ((s.bytesReceived - lastStats.bytes) * 8) / dt / 1000;
+          }
+          if (typeof s.bytesReceived === "number") lastStats = { at: now, bytes: s.bytesReceived };
+        }
+        if (s.type === "candidate-pair" && (s.selected || s.nominated || s.state === "succeeded")) {
+          if (typeof s.currentRoundTripTime === "number") rttMs = s.currentRoundTripTime * 1000;
+        }
+      });
+      state.rxStats = { fps, kbps, jitterMs, lostPct, rttMs };
+      send({
+        t: "rx-stats",
+        fps: fps === null ? null : Math.round(fps),
+        kbps: kbps === null ? null : Math.round(kbps),
+        jitter: jitterMs === null ? null : Math.round(jitterMs),
+        lost: lostPct === null ? null : Number(lostPct.toFixed(2)),
+        rtt: rttMs === null ? null : Math.round(rttMs),
+      });
+      if (hudVideo) {
+        const parts = [];
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        parts.push("视频：" + (vw ? vw + "×" + vh : "—") + " @ " + (fps === null ? "?" : fps.toFixed(0)) + "fps");
+        if (kbps !== null) parts.push(kbps.toFixed(0) + "kbps");
+        if (jitterMs !== null) parts.push("抖动 " + jitterMs.toFixed(0) + "ms");
+        if (lostPct !== null) parts.push("丢包 " + lostPct.toFixed(1) + "%");
+        if (rttMs !== null) parts.push("RTT " + rttMs.toFixed(0) + "ms");
+        hudVideo.textContent = parts.join(" · ");
+      }
+    }, 1000);
+  }
+  function stopVideoStats() {
+    if (statsTimer) {
+      clearInterval(statsTimer);
+      statsTimer = null;
+    }
+  }
+
   async function startPeer() {
     stopPeer();
     const pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
     state.pc = pc;
     const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
+    tuneReceiver(pc);
     // Prefer H.264: the PC encodes with NVENC.
     try {
       const caps = RTCRtpSender.getCapabilities("video");
@@ -269,6 +352,8 @@
       }
     } catch (_) {}
     pc.ontrack = (event) => {
+      tuneReceiver(pc);
+      startVideoStats();
       video.srcObject = event.streams[0];
       video.play().catch(() => {});
       video.onloadedmetadata = () => {
@@ -293,6 +378,7 @@
   }
 
   function stopPeer() {
+    stopVideoStats();
     if (state.pc) {
       try {
         state.pc.close();

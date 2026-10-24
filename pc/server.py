@@ -162,6 +162,7 @@ class GameState:
         self._win = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self.rx_stats: dict = {}
         self.window_title = ""
         self.window_missing_since = 0.0
 
@@ -230,11 +231,38 @@ class GameState:
             "capture_backend": getattr(self.capture._backend, "name", None),
             "frames_captured": self.capture.frames,
             "touch": dict(self.touch.stats),
+            "phone": self.rx_stats,
             "touch_backend": self.touch.describe(),
             "touch_details": self.touch.details(),
             "panel": panel_geometry(panel, detected=bool(panel) and panel_state in ("locked", "manual"), state=panel_state),
             "panel_detect": self.panel_watcher.status(),
         }
+
+    def set_rx_stats(self, data: dict) -> None:
+        """Remember what the phone reports about its own video reception."""
+
+        def number(key):
+            try:
+                return round(float(data.get(key)), 2)
+            except (TypeError, ValueError):
+                return None
+
+        self.rx_stats = {
+            "fps": number("fps"),
+            "kbps": number("kbps"),
+            "jitter_ms": number("jitter"),
+            "loss_pct": number("lost"),
+            "rtt_ms": number("rtt"),
+        }
+
+    def set_phone_count(self, count: int) -> None:
+        """Tell the touch backend whether somebody is playing through the phone."""
+        setter = getattr(self.touch, "set_connected", None)
+        if setter is not None:
+            try:
+                setter(count > 0)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("touch backend set_connected failed: %s", exc)
 
     def panel(self) -> tuple[dict | None, str]:
         return self.panel_watcher.effective()
@@ -392,6 +420,7 @@ class App:
                             await peer.close()
                         peer = RTCPeerConnection()
                         self.peers.add(peer)
+                        self.state.set_phone_count(len(self.peers))
                         peer.addTrack(self.video_track)
                         try:
                             capabilities = get_capabilities("video")
@@ -434,6 +463,18 @@ class App:
                         self.state.panel_watcher.set_manual(None)
                     elif kind == "stats":
                         await send({"t": "stats", "video": self.video_track.stats, "game": self.state.status()})
+                    elif kind == "rx-stats":
+                        # what the phone says it receives/decodes - the only place the
+                        # link quality is visible from this side
+                        self.state.set_rx_stats(data)
+                        log.info(
+                            "phone: %s fps, %s kbps, jitter %s ms, loss %s %%, rtt %s ms",
+                            data.get("fps"),
+                            data.get("kbps"),
+                            data.get("jitter"),
+                            data.get("lost"),
+                            data.get("rtt"),
+                        )
                 elif message.type == WSMsgType.ERROR:
                     break
         finally:
@@ -450,6 +491,7 @@ class App:
             if peer is not None:
                 await peer.close()
                 self.peers.discard(peer)
+            self.state.set_phone_count(len(self.peers))
             log.info("phone disconnected")
 
         return ws

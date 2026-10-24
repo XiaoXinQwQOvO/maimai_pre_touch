@@ -330,9 +330,9 @@ def detect_disc(
     reasons = []
     if not (0.12 <= r / width <= 0.50):
         reasons.append(f"radius {r / width:.3f} of the frame")
-    if not (0.35 <= cy / height <= 1.05):
+    if not (0.55 <= cy / height <= 1.00):
         reasons.append(f"centre y {cy / height:.3f}")
-    if not (-0.15 <= cx / width <= 0.80):
+    if not (0.05 <= cx / width <= 0.45):
         reasons.append(f"centre x {cx / width:.3f}")
     if reasons:
         LOG.debug("panel: rejected a circle candidate (%s)", ", ".join(reasons))

@@ -17,9 +17,9 @@
   },
   "video": {
     "encoder": "auto",
-    "bitrate_kbps": 9000,
+    "bitrate_kbps": 3000,
     "fps": 60,
-    "scale": 1.0
+    "scale": 0.5
   },
   "touch": {
     "backend": "maitouch",
