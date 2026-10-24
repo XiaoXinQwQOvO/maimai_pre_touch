@@ -17,7 +17,7 @@
 | 1b | 游戏→设备的命令 | 6 字符帧 `{`+5 字节：`{HALT}` / `{STAT}` / `{<a><sensor>k<value>}`（阈值下发）/ `{<a><sensor>th}` | §3.2 |
 | 2 | 谁在填这些字节 | **只有鼠标**：`GetAsyncKeyState(VK_LBUTTON)` + `GetCursorPos` + `ScreenToClient`，单点。WM_POINTER 路径代码存在但本机收不到任何 pointer 消息；**没有任何其他来源** | §4、§5 |
 | 3 | 合成触摸能否改变触摸状态 | **不能**。`CreateSyntheticPointerDevice` + `InjectSyntheticPointerInput` 返回成功，但系统不向窗口投递 WM_POINTER（普通窗口对照实验 0 条 WM_POINTER，鼠标对照有 4 类消息）→ 路线 (a) 不可行 | §5 |
-| 4 | 可外部控制的写入通道 | **路线 (b) 已验证**：把 `build_status`（RVA `0x43FD`）首字节改成 `ret`，再用 `WriteProcessMemory` 直接写 14 字节状态包到 `模块基址+0x18B040`。驱动层（`port_write` 钩子）与游戏侧读取（`port_read` 钩子）都回读到我们写入的字节 | §7 |
+| 4 | 可外部控制的写入通道 | **路线 (b) 已验证（驱动层）**：把 `build_status`（RVA `0x43FD`）首字节改成 `ret`，再用 `WriteProcessMemory` 直接写 14 字节状态包到 `模块基址+0x18B040`。我们写入的 14 字节**逐字节**出现在 mice 设备线程的 `port_write` 调用里；"游戏解析后产生触摸判定"这一步本环境（待机画面/无视觉）未能闭环，见 §7.3.1 与 §9-1 | §7 |
 
 **推荐给产品用的接口**：`tools/maitouch_state.py` 的 `MaitouchWriter`（纯 ctypes，无 frida 依赖），
 或 `tools/maitouch_ctl.py daemon`（UDP 命令服务）。
@@ -47,8 +47,8 @@ PE 结构（`tools/re_pe.py` 解析）：
 | `0x41C4` | `sensor_char_to_index` | 命令里的传感器字母 → 索引（0..19，跳过 4/9/14） |
 | `0x11793` | `port_write(this,buf,n)` | **设备→游戏**方向写（含 `0xD0` 转义） |
 | `0x1175E` | `port_read(this,buf,n)` | **游戏→设备**方向读（含反转义） |
-| `0x117D9` | `port_avail()` | FIFO 中可读字节数 |
-| `0x18D4E` / `0x18E05` | `ring_write` / `ring_read` | 每设备 2 KiB 环形 FIFO（`dev+0x800` 读指针、`dev+0x802` 写指针，掩码 `0x7ff`） |
+| `0x117D9` | `port_rx_avail()` | 返回 **RX（游戏→设备）**环中待处理字节数 |
+| `0x18D4E` / `0x18E05` | `ring_write` / `ring_read` | 每设备 2 KiB 环形 FIFO（`+0x800` 读指针、`+0x802` 写指针，掩码 `0x7ff`） |
 | `0x8DCD` | `contact_upsert(id,x,y,incontact)` | WM_POINTER 联系人表增删改 |
 | `0x8ED8` | `on_pointer(...)` | WM_POINTER 消息处理（要求 `GetPointerType()==2` 即 PT_TOUCH） |
 | `0x8FC1` | `subclass_wndproc` | 游戏窗口子类化过程，处理 `0x241-0x243, 0x246-0x247, 0x249-0x24C` |
@@ -292,7 +292,7 @@ r < 0.2241         -> 中心传感器：byte4 |= 0x10
 
 ---
 
-## 7. 可外部控制的写入通道（路线 b，已端到端验证）
+## 7. 可外部控制的写入通道（路线 b；驱动层已端到端验证）
 
 ### 7.1 原理
 
@@ -349,6 +349,46 @@ python tools/maitouch_ctl.py daemon --port 5599     # UDP: PING/SET/RAW/CLEAR/GE
 游戏侧读取验证见 `tools/frida_readfile_proof.py`（钩 `port_read` RVA `0x1175E`，
 它是游戏 `ReadFile` 最终落到 mice 的设备读处理）→ `tools/probe_out/readfile_proof.json`。
 
+### 7.3.1 游戏侧"消费"这一步的证据链（**尚未闭环**，如实记录）
+
+已完成的排查与结论：
+
+1. **游戏确实在用 maitouch 端口**（mice 自己的 `G:\Original\maimai\log.txt`）：
+   ```
+   [19:00:27] maimai_dump_.exe:I:maitouch:COM3 woke up
+   [19:00:40] maimai_dump_.exe:I:maitouch:Touchscreen left active mode
+   [19:00:44] maimai_dump_.exe:I:maitouch:Touchscreen entered active mode
+   ```
+   → `{STAT}`/`{HALT}` 由游戏进程发出，active 模式会随画面状态来回切。
+
+2. **hook `kernel32!ReadFile` 抓不到 COM3**：mice 用 IAT/inline 接管了 `ReadFile`
+   （它的通用 mock 在 `0x84B6`，先 lookup 句柄对象，再调 `dev+0x10` 的设备读处理；
+   未知句柄回落到真实 `ReadFile`）。实测 3 秒 2468 次调用，全部是大块资产文件读
+   （`want=4096/520192/360448/...`），没有 COM3 尺寸的读。
+
+3. **hook `port_read`(`0x1175E`) 看到的 `n=1` 单字节读不属于 maitouch 设备**：
+   那些调用的 `this` 是另一个设备对象（实测 `0x143FD88` / `0x13C1C38`），
+   内容是 `e0 ff 03 f1 01 05 …` 之类的二进制流。用 `ring_read`(`0x18E05`) 反查调用者，
+   它们的环形缓冲里出现 ASCII `"SEGA ENTERPRISES,LTD.;I/O BD JV"` ——
+   即同一进程里有多个虚拟设备（SEGA I/O board、maitouch、…），必须用 `this` 区分。
+
+4. **maitouch 设备的 TX 环形缓冲读数异常**：`port_write` 里 `lea ecx,[ebp+0x824]`
+   进 `ring_write`，其内部按 `[ecx+0x800]`/`[ecx+0x802]` 取读写指针，
+   即设备对象 `+0x1024`/`+0x1026`；静态看 `port_write` 的返回值来自 `ring_write`，
+   而 `port_rx_avail`(`0x117D9`) 用的是另一组指针（`+0x820`/`+0x822`，对应 RX 缓冲）。
+   实测该设备 2 秒内推 400 帧、`+0x1024` 恒为 0、`ring_write` 返回值 5 成功 / 667 失败。
+   **但这个判据不可信**：同样方式测 SEGA I/O 设备时，它明明在正常弹出数据，
+   `+0x800`/`+0x802` 也恒为 0 —— 说明这两个偏移不是"消费者是否在读"的可信信号，
+   环形缓冲结构还需要再逆向（见 §9-1）。
+
+5. **纯像素对比不可用**：待机画面下抓图，整窗 `changed_px ≈ 921584/921600`
+   （画面整体重绘），`mean` 差 255，无法区分"有无触摸反应"。
+
+结论：**链路已证到"我们写的 14 字节 = mice 自己的设备线程交给虚拟串口 TX 路径的 14 字节"**，
+"游戏解析后产生触摸判定"这一步需要在实际游戏画面里验证（一次按下-保持即可），
+本次实验环境（街机待机/演示画面 + 无视觉判断）无法闭环。写入点本身与 mice 自己的
+鼠标→触摸路径完全一致，因此只要游戏内鼠标触摸有效，本通道必然有效。
+
 > **已知边界**：本轮在**街机待机/演示画面**下做验证，画面像素差对比没有看到游戏内反应
 >（`before_vs_hold` 与 `before_vs_after` 的 mean 差都是 2.19，属于同一级动画噪声），
 > 因此"游戏**逻辑上**消费了这帧"这一步只有驱动层/读取层证据，没有"游戏内可观察行为"证据。
@@ -364,6 +404,20 @@ python tools/maitouch_ctl.py daemon --port 5599     # UDP: PING/SET/RAW/CLEAR/GE
 | 状态保持 | 无限期（冻结后无人重写） |
 | 恢复 | 写回 `0x55` 后 1 帧内恢复由鼠标驱动 |
 | 建议刷新策略 | 变化时写一次即可；若做保险可每 100 ms 重写一次（成本 ~ 1 µs） |
+
+**副作用（产品必须知道）**：`build_status` 正是把"真实鼠标/指针"翻译成传感器的函数，
+冻结它之后**游戏内的鼠标触摸模拟会失效**（外部写入成为唯一来源）。如果产品需要
+"脚本触摸 + 真人鼠标触摸"共存，改用代码洞方案：
+
+```
+在目标进程 VirtualAllocEx 一段可执行内存，写桩：
+    call build_status_original   ; 先把鼠标/指针状态算好（跳板需处理被覆盖的字节）
+    or   byte [packet+1..4], imm ; 再把脚本的传感器位 OR 进去
+    ret
+把 0x43FD 的 5 字节序言改成 jmp 该桩
+```
+代价是要处理 trampoline（被覆盖的 5 字节要搬到桩里再跳回 `0x43FD+5`），
+以及对 `+0x18B040` 的引用要跟着改基址。若不需要共存，直接 `ret` 补丁即可。
 
 ### 7.5 生产化建议
 
@@ -385,6 +439,9 @@ python tools/maitouch_ctl.py daemon --port 5599     # UDP: PING/SET/RAW/CLEAR/GE
 | 游戏重启 | 补丁失效、基址变化、包缓冲重置 | 重新获取 base 再 `freeze()` + 写包 |
 | 服务先于游戏启动 | 首次指令失败 | 失败后自动重试（daemon 已实现：出错即丢弃句柄，下次指令重连） |
 | 补丁未打就写包 | 包被 `build_status` 立刻覆盖 | 必须先 `freeze()`（`set/raw/clear` 都内置调用） |
+| 设备线程重启（游戏重开端口） | 线程初始化会写 `packet[0]=0x28`、`word[5]=0x4040`、`word[0xb]=0x4040`、`packet[0xd]=0x29`（RVA `0x4528` 的初始化序列） | 它**不碰** `packet[1..4]`，所以我们的传感器位不会被清；帧头帧尾也会被正确重写，无需处理 |
+| 多个进程都加载了 mice.dll | `CameraUploader.exe` / `GmSync.exe` 里也有 `maitouch:COM3 woke up` | 只对 `maimai_dump_.exe` 打补丁（`find_pid()` 优先该名字），不要按模块名乱找 |
+| 32/64 位差异 | 目标为 32 位进程；64 位 Python 也能 `Toolhelp32` + `WriteProcessMemory` | 已验证（本机 64 位 Python 直接操作 32 位游戏） |
 
 ---
 
@@ -422,9 +479,13 @@ MovieProc.exe / ALLNetProc.exe / CameraUploader.exe / GmSync.exe`；
 
 ## 9. 未解决问题 / 边界
 
-1. **游戏内可观察行为的最终确认**：本轮只在待机画面验证到驱动层与读取层。
-   需要在实际游戏画面里（或 touch 测试界面）做"按住某传感器 → 游戏内出现触摸判定"的确认。
-   最省事的做法：`python tools\maitouch_ctl.py set C`，看游戏画面/日志是否响应。
+1. **游戏内可观察行为的最终确认（最高优先级）**：本轮只在待机画面验证到驱动层与写入层。
+   需要在实际游戏画面里（或 touch 测试界面）做"按住某传感器 → 游戏内出现触摸判定"的确认，
+   顺带确认"游戏内鼠标点触摸面板是否有效"（这是判断 maitouch 链路是否真的被消费的关键；
+   若鼠标在游戏内也无效，说明该环境下 maitouch 通道没有被消费，问题不在我们的写入点）。
+   最省事的做法：`python tools\maitouch_ctl.py set C`，看游戏是否响应。
+   连带待办：mice 环形缓冲的真实结构（读写指针位置/是否有第二消费点）尚未完全逆向，
+   `tools/frida_panel_probe.py` 可复现 §7.3.1-4 的读数异常。
 2. **17 传感器 → 游戏 zone 的映射**：maimai 侧把 17 个传感器展开成它自己的 zone（含 `A1..E?` 命名），
    本次未逆向游戏本体，因此只能给出"传感器位 → 屏幕方位/环"的映射。
    若产品需要按游戏 zone 名下发，需要再逆向 `maimai_dump_.exe` 的触摸解析。
@@ -433,3 +494,39 @@ MovieProc.exe / ALLNetProc.exe / CameraUploader.exe / GmSync.exe`；
    要实抓需在 `frida.spawn` 阶段就 attach。
 5. `idle` 相位抓到 6 次单字节读（`e0 ff 03 f0 …`）不属于 maitouch 命令帧，
    怀疑是同一 `port_read` 被其它虚拟设备复用，未深究。
+
+---
+
+## 10. 给 `pc/touch_backends.py` → `MaitouchStateBackend` 的接口建议
+
+**推荐形态**（与你的 plan 一致，确认可行）：
+
+```python
+class MaitouchStateBackend(TouchBackend):
+    def start(self):     # 懒连接 + 幂等
+        self._w = None; self._contacts = {}          # contact_id -> (nx, ny)
+    def _ensure(self):   # 进程/模块就绪 + 补丁就位；失败抛出让上层重试
+        if self._w is None or self._w.pid_dead(): self._w = MaitouchWriter()
+        if not self._w.frozen: self._w.freeze()
+    def press(self, cid, nx, ny):  self._contacts[cid] = (nx, ny); self._flush()
+    def move(self,  cid, nx, ny):  self._contacts[cid] = (nx, ny); self._flush()
+    def release(self, cid):        self._contacts.pop(cid, None);   self._flush()
+    def _flush(self):              # 累积 -> 一次写入（写变化时才写）
+        zones = {MS.zone_at(nx * 960, ny * 960) for nx, ny in self._contacts.values()}
+        self._ensure(); self._w.write_packet(MS.packet_from_zones([z for z in zones if z]))
+    def stop(self):       # 还原补丁，避免留下"鼠标触摸失效"的副作用
+        if self._w: self._w.restore()
+```
+
+要点：
+
+* **累积 + 变化时写** 是正确的：17 个传感器位 OR 进同一个包，多押天然支持（一个包 = 一帧全部触点）。
+  实测一帧包字节完全相同、写入是原子的（`WriteProcessMemory` 14 字节一次完成），不会出现半帧。
+* 归一化坐标：`nx,ny ∈ [0,1]` → 客户区像素 `x = nx * client_w`（本机 960）；
+  `zone_at()` 已包含全部阈值，**不要**在上层再写死几何常量。
+* 不需要周期性重写（冻结后无人覆盖，包会一直保持）。若要保险，1 Hz 重写一次即可；**不要**用 >100 Hz 的高频覆写，没有意义。
+* 还原：`stop()` 里把 `0x55` 写回，否则游戏里鼠标触摸一直失效。
+
+必须处理的失败模式（§7.6 有完整表）：进程未启动/已退出（懒连接 + 重试）、`mice.dll` 未加载、
+补丁被拒（序言不是 `0x55`，通常是还有 frida/DLL 挂着）、游戏重启（基址变化 → 重新 `probe` + `freeze` + 写包）、
+服务先于游戏启动（首次指令失败后重试，别缓存 pid/base）、不要误对 `CameraUploader.exe`/`GmSync.exe` 打补丁。

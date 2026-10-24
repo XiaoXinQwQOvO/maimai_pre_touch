@@ -36,11 +36,11 @@ FIFO_JS = r"""
 (function () {
   let BASE = null;
   let st = null;
-  function fresh() { return { samples: [], npush: 0, devs: {} }; }
+  function fresh() { return { samples: [], npush: 0, devs: {}, reads: [], nread: 0 }; }
   st = fresh();
   function hex(p, n) {
     try {
-      const u8 = new Uint8Array(p.readByteArray(n));
+      const u8 = new Uint8Array(p.readByteArray(Math.min(n, 64)));
       let s = '';
       for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, '0');
       return s;
@@ -68,6 +68,23 @@ FIFO_JS = r"""
             st.samples.push({ dev: key, rd: rd, wr: wr, pkt: hex(this.context.edx, 14) });
           }
         } catch (e) { st.devs['err:' + e.message] = 1; }
+      }
+    });
+    // game -> device direction: which device object, how many bytes, what data
+    Interceptor.attach(BASE.add(0x1175e), {
+      onEnter(args) {
+        this.self = this.context.ecx;
+        this.buf = this.context.edx;
+        this.n = args[0].toInt32();
+      },
+      onLeave() {
+        st.nread++;
+        if (st.reads.length < 200) {
+          let rd = -1, wr = -1;
+          try { rd = this.self.add(0x800).readU16(); wr = this.self.add(0x802).readU16(); } catch (e) { }
+          st.reads.push({ dev: this.self.toString(), n: this.n, hex: hex(this.buf, this.n),
+                          rd: rd, wr: wr });
+        }
       }
     });
     send({ t: 'ready', base: BASE.toString() });
@@ -113,10 +130,14 @@ def main():
         print(f"[i] pid={pid}")
         deadline = time.time() + args.ready_timeout
         while time.time() < deadline:
-            if ex.peek()["npush"] > 200:
+            n = ex.peek()["npush"]
+            if n > 100:
                 break
             time.sleep(0.5)
-        print("[i] pushing")
+        else:
+            print(f"[!] no status packets within {args.ready_timeout}s "
+                  f"(maitouch not in active mode)")
+        print(f"[i] pushing (npush so far: {ex.peek()['npush']})")
 
         # phase 1: idle, 2 s
         ex.reset()
@@ -125,11 +146,14 @@ def main():
         rep["idle"] = s1
         rds = [x["rd"] for x in s1["samples"]]
         wrs = [x["wr"] for x in s1["samples"]]
-        print(f"[i] idle: {s1['npush']} pushes, devs={s1['devs']}")
+        print("[i] idle: %d pushes, devs=%s" % (s1["npush"], s1["devs"]))
         print(f"    read ptr  range {min(rds) if rds else None}..{max(rds) if rds else None} "
               f"distinct={len(set(rds))}")
         print(f"    write ptr range {min(wrs) if wrs else None}..{max(wrs) if wrs else None} "
               f"distinct={len(set(wrs))}")
+        print(f"    game->device reads: {s1['nread']}")
+        for r in s1["reads"][:8]:
+            print(f"      dev={r['dev']} n={r['n']} hex={r['hex'][:40]} rd={r['rd']} wr={r['wr']}")
         rep["idle_distinct_rd"] = len(set(rds))
         rep["idle_distinct_wr"] = len(set(wrs))
 

@@ -1,7 +1,7 @@
 """maimai_pre_touch PC server: capture the game window, stream it over WebRTC and
 apply the touch events that the phone sends back.
 
-Run:  python pc/server.py [--port 8770] [--touch synth|log] [--region L,T,W,H]
+Run:  python pc/server.py [--port 8770] [--touch maitouch|log|synth] [--region L,T,W,H]
 """
 from __future__ import annotations
 
@@ -24,10 +24,10 @@ sys.path.insert(0, HERE)
 
 import config as config_mod  # noqa: E402
 import window as window_mod  # noqa: E402
+import sensors  # noqa: E402
 from capture import CaptureManager  # noqa: E402
 from touch_backends import create_backend  # noqa: E402
 from video import GameVideoTrack, install_encoder  # noqa: E402
-from zone_map import ZoneMap  # noqa: E402
 
 log = logging.getLogger("server")
 
@@ -41,6 +41,18 @@ def lan_ip() -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def panel_geometry() -> dict:
+    """The sensor layout the phone should draw (see pc/sensors.py)."""
+    return {
+        "r_centre": sensors.R_CENTRE,
+        "r_inner": sensors.R_INNER,
+        "r_max": sensors.R_MAX,
+        "sectors": sensors.SECTORS,
+        "labels": sensors.LABELS,
+        "count": len(sensors.SENSORS),
+    }
 
 
 class GameState:
@@ -57,9 +69,9 @@ class GameState:
         self.window_title = ""
         self.window_missing_since = 0.0
 
-        touch_cfg = cfg.get("touch", {})
-        self.zone_map = ZoneMap.from_config(touch_cfg.get("zone_map", {}))
-        self.touch = create_backend(touch_cfg, self.client_rect, self.zone_map)
+        touch_cfg = dict(cfg.get("touch", {}))
+        touch_cfg.setdefault("process_names", tuple(cfg.get("capture", {}).get("process_names", ())))
+        self.touch = create_backend(touch_cfg, self.client_rect)
         self.capture = CaptureManager(cfg.get("capture", {}), self.region_for_capture)
         self.tracker = threading.Thread(target=self._track_loop, name="window-tracker", daemon=True)
 
@@ -119,12 +131,8 @@ class GameState:
             "frames_captured": self.capture.frames,
             "touch": dict(self.touch.stats),
             "touch_backend": self.touch.describe(),
-            "zone_map": {
-                "center": self.zone_map.center,
-                "ring_edges": self.zone_map.ring_edges,
-                "sectors": self.zone_map.sectors,
-                "sector_offset_deg": self.zone_map.sector_offset_deg,
-            },
+            "touch_details": self.touch.details(),
+            "panel": panel_geometry(),
         }
 
 
@@ -160,12 +168,8 @@ class App:
     async def healthz(self, request: web.Request):
         return web.json_response({"ok": True})
 
-    async def zone_map(self, request: web.Request):
-        body = await request.json()
-        cfg = dict(self.cfg.get("touch", {}).get("zone_map", {}))
-        cfg.update(body or {})
-        self.state.zone_map = ZoneMap.from_config(cfg)
-        return web.json_response({"ok": True, "zone_map": cfg})
+    async def panel(self, request: web.Request):
+        return web.json_response({"ok": True, **panel_geometry()})
 
     # --- WebSocket ---------------------------------------------------------
 
@@ -188,12 +192,7 @@ class App:
                 "t": "welcome",
                 "server": "maimai_pre_touch",
                 "version": 1,
-                "zone_map": {
-                    "center": list(self.state.zone_map.center),
-                    "ring_edges": list(self.state.zone_map.ring_edges),
-                    "sectors": self.state.zone_map.sectors,
-                    "sector_offset_deg": self.state.zone_map.sector_offset_deg,
-                },
+                "panel": panel_geometry(),
                 "window": self.state.status()["client_rect"],
                 "touch_backend": self.state.touch.describe(),
                 "video": {
@@ -204,6 +203,7 @@ class App:
             }
         )
 
+        active: set[int] = set()
         try:
             async for message in ws:
                 if message.type == WSMsgType.TEXT:
@@ -256,17 +256,20 @@ class App:
                                 break
                         await send({"t": "answer", "sdp": sdp, "type": peer.localDescription.type})
                     elif kind == "touch":
-                        self._handle_touch(data)
-                    elif kind == "zone_map":
-                        cfg = dict(self.cfg.get("touch", {}).get("zone_map", {}))
-                        cfg.update(data.get("zone_map", {}))
-                        self.state.zone_map = ZoneMap.from_config(cfg)
-                        log.info("zone map updated: %s", self.state.zone_map.describe())
+                        self._handle_touch(data, active)
                     elif kind == "stats":
                         await send({"t": "stats", "video": self.video_track.stats, "game": self.state.status()})
                 elif message.type == WSMsgType.ERROR:
                     break
         finally:
+            if active:
+                # never leave a finger pressed when the phone goes away
+                for contact_id in list(active):
+                    try:
+                        self.state.touch.release(contact_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                log.info("released %d touch contact(s) held by the disconnected phone", len(active))
             self.clients -= 1
             if peer is not None:
                 await peer.close()
@@ -275,21 +278,25 @@ class App:
 
         return ws
 
-    def _handle_touch(self, data: dict) -> None:
+    def _handle_touch(self, data: dict, held: set) -> None:
+        """Apply one touch message, tracking the contacts this connection holds."""
         action = data.get("a")
         contact_id = int(data.get("id", 1))
         nx = float(data.get("x", 0.0))
         ny = float(data.get("y", 0.0))
         snap = bool(data.get("snap", False))
         if snap:
-            nx, ny = self.state.zone_map.snap(nx, ny)
+            nx, ny = sensors.snap_to_sensor(nx, ny)
         try:
             if action == "down":
                 self.state.touch.press(contact_id, nx, ny)
+                held.add(contact_id)
             elif action == "move":
                 self.state.touch.move(contact_id, nx, ny)
+                held.add(contact_id)
             elif action == "up":
                 self.state.touch.release(contact_id)
+                held.discard(contact_id)
         except Exception as exc:  # never let a bad touch kill the connection
             log.warning("touch handling failed: %s", exc)
 
@@ -302,7 +309,7 @@ def make_app(cfg: dict, state: GameState) -> web.Application:
     app.router.add_get("/ws", app_impl.ws)
     app.router.add_get("/api/status", app_impl.status)
     app.router.add_get("/healthz", app_impl.healthz)
-    app.router.add_post("/api/zone_map", app_impl.zone_map)
+    app.router.add_get("/api/panel", app_impl.panel)
     if os.path.isdir(WEB_DIR):
         app.router.add_static("/app/", WEB_DIR, show_index=False)
     return app
@@ -326,7 +333,7 @@ async def run(args) -> None:
     follow = not args.no_follow_window
     state = GameState(cfg, region_override=args.region, follow_window=follow)
     state.start()
-    log.info("%s", state.zone_map.describe())
+    log.info("panel: %d sensors (centre %.4f, inner ring %.4f)", len(sensors.SENSORS), sensors.R_CENTRE, sensors.R_INNER)
     log.info("touch backend: %s", state.touch.describe())
 
     app = make_app(cfg, state)

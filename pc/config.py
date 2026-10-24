@@ -19,15 +19,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "video": {"encoder": "auto", "bitrate_kbps": 9000, "fps": 60, "scale": 1.0},
     "touch": {
-        "backend": "synth",
+        "backend": "maitouch",
+        "process_names": ["maimai_dump_.exe", "maimai.exe"],
         "max_contacts": 10,
-        "snap_to_zone": False,
-        "zone_map": {
-            "center": [0.5, 0.5],
-            "ring_edges": [0.34, 0.5, 0.66, 0.82, 1.0],
-            "sectors": 8,
-            "sector_offset_deg": 0.0,
-        },
     },
     "debug": {"log_level": "INFO", "save_frames": False},
 }
@@ -50,7 +44,7 @@ def load(path: str | None = None) -> dict[str, Any]:
     if not os.path.exists(path):
         save(DEFAULT_CONFIG, path)
         return copy.deepcopy(DEFAULT_CONFIG)
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, "r", encoding="utf-8-sig") as fh:
         user = json.load(fh)
     return _deep_merge(DEFAULT_CONFIG, user)
 

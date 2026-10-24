@@ -9,7 +9,7 @@
   let st = null;
 
   function fresh() {
-    return { pk14: {}, writes: {}, reads: [], nreads: 0, nwrites: 0 };
+    return { pk14: {}, writes: {}, reads: [], nreads: 0, nwrites: 0, fifo: [], devs: {} };
   }
   st = fresh();
 
@@ -33,21 +33,45 @@
   function install(mod) {
     BASE = mod.base;
     try {
-      // port_write(this, buf, n)
+      // port_write(this, buf, n)   this+0x824 = TX ring struct,
+      // read ptr = u16@this+0x1024, write ptr = u16@this+0x1026
       Interceptor.attach(BASE.add(0x11793), {
         onEnter(args) {
           const n = args[0].toInt32();
           const h = hex(this.context.edx, n);
           st.nwrites++;
-          if (n === 14) st.pk14[h] = (st.pk14[h] || 0) + 1;
-          else if (Object.keys(st.writes).length < 200) st.writes[n + ':' + h] = (st.writes[n + ':' + h] || 0) + 1;
+          if (n === 14) {
+            st.pk14[h] = (st.pk14[h] || 0) + 1;
+            const dev = this.context.ecx;
+            this.dev = dev;
+            try {
+              const rd = dev.add(0x1024).readU16();
+              const wr = dev.add(0x1026).readU16();
+              st.devs[dev.toString()] = (st.devs[dev.toString()] || 0) + 1;
+              if (st.fifo.length < 400) st.fifo.push([rd, wr]);
+            } catch (e) { }
+          } else if (Object.keys(st.writes).length < 200) st.writes[n + ':' + h] = (st.writes[n + ':' + h] || 0) + 1;
+        },
+        onLeave(ret) {
+          if (this.dev) {
+            st.ok = st.ok || 0; st.bad = st.bad || 0;
+            if ((ret.toInt32() & 0xff) !== 0) st.ok++; else st.bad++;
+          }
         }
       });
       // port_read(this, buf, n)
       Interceptor.attach(BASE.add(0x1175e), {
-        onEnter(args) { this.n = args[0].toInt32(); this.buf = this.context.edx; },
+        onEnter(args) {
+          this.n = args[0].toInt32();
+          this.buf = this.context.edx;
+          this.self = this.context.ecx;
+        },
         onLeave() {
-          if (st.reads.length < 400) st.reads.push([this.n, hex(this.buf, this.n)]);
+          let rd = -1, wr = -1;
+          try { rd = this.self.add(0x800).readU16(); wr = this.self.add(0x802).readU16(); } catch (e) { }
+          if (st.reads.length < 400) {
+            st.reads.push([this.n, hex(this.buf, this.n), this.self.toString(), rd, wr]);
+          }
           st.nreads++;
         }
       });

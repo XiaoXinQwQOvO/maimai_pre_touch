@@ -156,6 +156,10 @@ html, body {
   font-size: 14px;
 }
 
+#panel input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
+
+#hud-model { color: var(--accent); }
+
 #panel .hint {
   color: var(--dim);
   font-size: 12px;

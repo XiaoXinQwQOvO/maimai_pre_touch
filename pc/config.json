@@ -8,7 +8,10 @@
     "output_idx": 0,
     "fps": 60,
     "follow_window": true,
-    "process_names": ["maimai.exe", "maimai_dump_.exe"],
+    "process_names": [
+      "maimai_dump_.exe",
+      "maimai.exe"
+    ],
     "window_class_substr": "teaGfx",
     "region": null
   },
@@ -19,15 +22,12 @@
     "scale": 1.0
   },
   "touch": {
-    "backend": "synth",
-    "max_contacts": 10,
-    "snap_to_zone": false,
-    "zone_map": {
-      "center": [0.5, 0.5],
-      "ring_edges": [0.34, 0.5, 0.66, 0.82, 1.0],
-      "sectors": 8,
-      "sector_offset_deg": 0.0
-    }
+    "backend": "maitouch",
+    "process_names": [
+      "maimai_dump_.exe",
+      "maimai.exe"
+    ],
+    "max_contacts": 10
   },
   "debug": {
     "log_level": "INFO",
