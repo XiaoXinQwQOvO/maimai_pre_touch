@@ -76,6 +76,22 @@ class MODULEENTRY32(ctypes.Structure):
     ]
 
 
+TH32CS_SNAPTHREAD = 0x00000004
+THREAD_SUSPEND_RESUME = 0x0002
+
+
+class THREADENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("cntUsage", wt.DWORD),
+        ("th32ThreadID", wt.DWORD),
+        ("th32OwnerProcessID", wt.DWORD),
+        ("tpBasePri", wt.LONG),
+        ("tpDeltaPri", wt.LONG),
+        ("dwFlags", wt.DWORD),
+    ]
+
+
 class PROCESSENTRY32(ctypes.Structure):
     _fields_ = [
         ("dwSize", wt.DWORD), ("cntUsage", wt.DWORD), ("th32ProcessID", wt.DWORD),
@@ -232,20 +248,64 @@ class MaitouchPort:
                 return None
             return buffer.raw[: read.value]
 
-    def write(self, rva: int, data: bytes) -> bool:
+    def _suspend_threads(self) -> list:
+        """Suspend every thread of the game (used around a patch on live code).
+
+        Turning ``push ebp`` into ``ret`` while another thread is between fetching and
+        executing that byte makes it run a ``ret`` without a frame - the game then dies
+        with an access violation (observed twice).  Suspending first makes the write land
+        on an idle instruction stream.
+        """
+        handles: list = []
+        if not self._pid:
+            return handles
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+        if snapshot == INVALID_HANDLE_VALUE:
+            return handles
+        entry = THREADENTRY32()
+        entry.dwSize = ctypes.sizeof(THREADENTRY32)
+        try:
+            ok = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+            while ok:
+                if entry.th32OwnerProcessID == self._pid:
+                    h = kernel32.OpenThread(THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                    if h:
+                        kernel32.SuspendThread(h)
+                        handles.append(h)
+                ok = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return handles
+
+    @staticmethod
+    def _resume_threads(handles: list) -> None:
+        for handle in reversed(handles):
+            kernel32.ResumeThread(handle)
+            kernel32.CloseHandle(handle)
+
+    def write(self, rva: int, data: bytes, code: bool = False) -> bool:
         with self._lock:
             if self._handle is None:
                 return False
-            buffer = ctypes.create_string_buffer(data, len(data))
-            written = ctypes.c_size_t(0)
-            ok = kernel32.WriteProcessMemory(
-                self._handle, ctypes.c_void_p(self._base + rva), buffer, len(data), ctypes.byref(written)
-            )
-            if not ok:
-                self.last_error = f"WriteProcessMemory({rva:#x}) failed: {ctypes.get_last_error()}"
-                self.detach()
-                return False
-            return written.value == len(data)
+            handles = self._suspend_threads() if code else []
+            try:
+                buffer = ctypes.create_string_buffer(data, len(data))
+                written = ctypes.c_size_t(0)
+                ok = kernel32.WriteProcessMemory(
+                    self._handle,
+                    ctypes.c_void_p(self._base + rva),
+                    buffer,
+                    len(data),
+                    ctypes.byref(written),
+                )
+                if not ok:
+                    self.last_error = f"WriteProcessMemory({rva:#x}) failed: {ctypes.get_last_error()}"
+                    self.detach()
+                    return False
+                return written.value == len(data)
+            finally:
+                if handles:
+                    self._resume_threads(handles)
 
     # -- state --------------------------------------------------------------
     def probe(self) -> dict:
@@ -286,7 +346,7 @@ class MaitouchPort:
                 )
                 self._say("warning", "%s", self.last_error)
                 return False
-            if not self.write(BUILD_STATUS_RVA, bytes([BUILD_STATUS_PATCH])):
+            if not self.write(BUILD_STATUS_RVA, bytes([BUILD_STATUS_PATCH]), code=True):
                 return False
             check = self.read(BUILD_STATUS_RVA, 1)
             if not check or check[0] != BUILD_STATUS_PATCH:
@@ -306,7 +366,7 @@ class MaitouchPort:
             if current[0] == BUILD_STATUS_ORIG:
                 self._frozen = False
                 return True
-            if not self.write(BUILD_STATUS_RVA, bytes([BUILD_STATUS_ORIG])):
+            if not self.write(BUILD_STATUS_RVA, bytes([BUILD_STATUS_ORIG]), code=True):
                 return False
             self._frozen = False
             self._say("info", "build_status restored")

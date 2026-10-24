@@ -489,6 +489,10 @@ def make_app(cfg: dict, state: GameState) -> web.Application:
     app.router.add_get("/api/panel", app_impl.panel)
     app.router.add_post("/api/panel", app_impl.panel_set)
     if os.path.isdir(WEB_DIR):
+        # the phone app opens ``http://<pc>:8770/app/``: register the directory itself
+        # before the static handler, which otherwise answers 403 (no directory listing)
+        app.router.add_get("/app", app_impl.index)
+        app.router.add_get("/app/", app_impl.index)
         app.router.add_static("/app/", WEB_DIR, show_index=False)
     return app
 

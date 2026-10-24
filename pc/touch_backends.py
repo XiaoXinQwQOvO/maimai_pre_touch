@@ -94,7 +94,13 @@ class MaitouchPortBackend(TouchBackend):
 
     name = "maitouch"
 
-    def __init__(self, process_names=None, watch_interval: float = 1.0, panel_provider=None):
+    def __init__(
+        self,
+        process_names=None,
+        watch_interval: float = 1.0,
+        panel_provider=None,
+        idle_restore_seconds: float = 0.0,
+    ):
         super().__init__(panel_provider)
         import atexit
 
@@ -103,7 +109,13 @@ class MaitouchPortBackend(TouchBackend):
         self._port = MaitouchPort(process_names=process_names or ("maimai_dump_.exe", "maimai.exe"), log=log)
         self._contacts: dict[int, str] = {}
         self._watch_interval = watch_interval
-        self._idle_restore = 5.0  # seconds without contacts before we hand control back
+        # Seconds without contacts before we hand control back.  Flipping the first byte
+        # of build_status back and forth while the game's threads are executing it is the
+        # one risky operation here, so by default the patch stays in place for as long as
+        # this server runs (the in-game mouse then ignores touches, which is fine while
+        # the phone drives the panel) and it is removed on disconnect/exit.
+        self._idle_restore = idle_restore_seconds if idle_restore_seconds > 0 else 5.0
+        self._connected = False
         self._stop = threading.Event()
         self._watchdog = threading.Thread(target=self._watch_loop, name="maitouch-watch", daemon=True)
         self._watchdog.start()
@@ -138,11 +150,11 @@ class MaitouchPortBackend(TouchBackend):
                         log.warning("maitouch: lost the game (%s)", self._port.last_error)
                     was_attached = self._port.attached
                     continue
-                # only keep build_status frozen while the phone is actually in use,
-                # so a mouse stays usable (and a crashed server is less harmful)
+                # only hand control back when nobody is playing through the phone
                 if (
                     self._port.frozen
                     and not self._contacts
+                    and not self._connected
                     and time.time() - self.stats["last_event"] > self._idle_restore
                 ):
                     self._port.restore()
@@ -150,6 +162,10 @@ class MaitouchPortBackend(TouchBackend):
             except Exception as exc:  # noqa: BLE001 - never kill the watchdog
                 log.warning("maitouch watchdog: %s", exc)
             was_attached = self._port.attached
+
+    def set_connected(self, connected: bool) -> None:
+        """A phone is (or is no longer) driving the panel."""
+        self._connected = bool(connected)
 
     def _current_sensors(self) -> list[str]:
         return sorted(set(self._contacts.values()), key=sensors.SENSOR_ORDER.index)
@@ -346,7 +362,9 @@ def create_backend(cfg: dict, client_rect_provider, zone_map=None, panel_provide
     max_contacts = int((cfg or {}).get("max_contacts", 10))
     if kind in ("maitouch", "port"):
         return MaitouchPortBackend(
-            process_names=(cfg or {}).get("process_names"), panel_provider=panel_provider
+            process_names=(cfg or {}).get("process_names"),
+            panel_provider=panel_provider,
+            idle_restore_seconds=float((cfg or {}).get("idle_restore_seconds", 0.0) or 0.0),
         )
     if kind == "synth":
         return SyntheticTouchBackend(
