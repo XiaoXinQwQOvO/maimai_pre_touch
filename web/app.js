@@ -531,6 +531,7 @@
     lost: "重新检测中…",
     dark: "等待游戏画面（黑屏）",
     starting: "启动中…",
+    assumed: "默认位置（还没识别到圆）",
   };
 
   function applyPanel(incoming) {

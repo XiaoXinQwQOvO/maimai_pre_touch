@@ -139,7 +139,10 @@ class PanelWatcher(threading.Thread):
         if panel is not None:
             return panel, "locked"
         state = getattr(self._tracker, "state", "starting")
-        return None, state
+        # Until the circle has been seen once, fall back to where this game always draws
+        # it: the whole frame as the panel would send every touch to a wrong sensor.
+        fallback = self.cfg.get("fallback") or DEFAULT_PANEL
+        return dict(fallback), "assumed"
 
     def status(self) -> dict:
         panel, state = self.effective()
@@ -150,6 +153,11 @@ class PanelWatcher(threading.Thread):
             "tracker_state": tracker_state,
             "panel": panel,
         }
+
+
+#: Where this game draws its panel (measured on the waiting screen).  Used until the
+#: circle has been detected once, and as the starting point for the phone's fine-tuning.
+DEFAULT_PANEL = {"cx": 0.2495, "cy": 0.7631, "rx": 0.2495, "ry": 0.2355}
 
 
 class GameState:
