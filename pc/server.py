@@ -157,6 +157,9 @@ class App:
         }
         return web.json_response(payload)
 
+    async def healthz(self, request: web.Request):
+        return web.json_response({"ok": True})
+
     async def zone_map(self, request: web.Request):
         body = await request.json()
         cfg = dict(self.cfg.get("touch", {}).get("zone_map", {}))
@@ -218,11 +221,13 @@ class App:
                         self.peers.add(peer)
                         peer.addTrack(self.video_track)
                         try:
-                            caps = get_capabilities("video")["codecs"]
+                            capabilities = get_capabilities("video")
+                            caps = getattr(capabilities, "codecs", None) or capabilities["codecs"]
                             h264 = [c for c in caps if c.name.upper() == "H264"]
                             vp8 = [c for c in caps if c.name.upper() == "VP8"]
                             if h264:
                                 peer.getTransceivers()[0].setCodecPreferences(h264 + vp8)
+                                log.info("codec preference: H264 (%d profiles) then VP8", len(h264))
                         except Exception as exc:
                             log.warning("codec preference failed: %s", exc)
 
@@ -240,6 +245,15 @@ class App:
                         sdp = peer.localDescription.sdp
                         mline = next((line for line in sdp.splitlines() if line.startswith("m=video")), "")
                         log.info("answer video line: %s", mline)
+                        first_pt = None
+                        if mline:
+                            fields = mline.split()
+                            if len(fields) >= 4:
+                                first_pt = fields[3]
+                        for line in sdp.splitlines():
+                            if first_pt and line.startswith(f"a=rtpmap:{first_pt} "):
+                                log.info("negotiated video codec: %s (pt %s)", line.split(" ", 1)[1], first_pt)
+                                break
                         await send({"t": "answer", "sdp": sdp, "type": peer.localDescription.type})
                     elif kind == "touch":
                         self._handle_touch(data)
@@ -287,6 +301,7 @@ def make_app(cfg: dict, state: GameState) -> web.Application:
     app.router.add_get("/", app_impl.index)
     app.router.add_get("/ws", app_impl.ws)
     app.router.add_get("/api/status", app_impl.status)
+    app.router.add_get("/healthz", app_impl.healthz)
     app.router.add_post("/api/zone_map", app_impl.zone_map)
     if os.path.isdir(WEB_DIR):
         app.router.add_static("/app/", WEB_DIR, show_index=False)
@@ -335,6 +350,11 @@ async def run(args) -> None:
 
 
 def main(argv=None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(description="maimai_pre_touch PC server")
     parser.add_argument("--config", default=None, help="path to config.json")
     parser.add_argument("--port", type=int, default=None)

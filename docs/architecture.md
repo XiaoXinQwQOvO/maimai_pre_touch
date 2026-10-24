@@ -82,17 +82,34 @@ H.264 码流用 libav 解码 30/30 帧全部正确；NAL 类型 `SEI/STAP-A/FU-A
 
 | 项 | 值 | 说明 |
 | --- | --- | --- |
+| 输入格式 | `bgra`（NVENC 时） | DXGI 直接给 BGRA，NVENC 在显卡上转 NV12；比在 Python 里 swscale 转 yuv420p 省 **5.3 ms/帧** |
 | profile | baseline | 兼容性最好，浏览器 H.264 硬解首选 |
 | rc / preset / tune | cbr / p1 / ull | 恒定码率 + 最快档 + 超低延迟（无 B 帧、无前瞻） |
 | delay | 0 | 不缓冲帧 |
 | 码率 | 9000 kbps（可配） | 960×960@60 的 maimai 画面足够；Wi-Fi 差可降到 4000–6000 |
 | time_base | 1/90 | 与 aiortc 的 `MAX_FRAME_RATE` / `VIDEO_TIME_BASE` 保持一致 |
 
-### 端到端帧率
+### 两个必须知道的坑
 
-服务端容量约 60 fps（抓屏 60.7 + 编码 700 fps 余量）。
-`tools/test_client.py`（Python/aiortc 软解）实测 32 fps —— 瓶颈是**模拟器端的软件解码**；
-真机由浏览器/WebView 硬解，可跑满 60。
+1. **aiortc 的节奏是 30 fps 写死的**：`MediaStreamTrack.next_timestamp()` 里
+   `VIDEO_PTIME = 1/30`，与 track 的 `fps` 无关。直接用它，60 fps 的采集会被砍成 30 fps
+   （实测 32.9 fps）。所以 `GameVideoTrack.recv()` 自己按 `VIDEO_CLOCK_RATE / fps` 递增 pts 并
+   sleep 到目标时刻，落后 1 s 以上时重新对齐而不是补帧。
+2. **`dxcam.get_latest_frame()` 会阻塞到下一帧（≤16 ms）**。若直接在主协程里调用，
+   事件循环有 80% 时间被占住，WebSocket 触摸/信令要排队。改成 `asyncio.to_thread()` 后
+   控制面 RTT 从 0–7 ms（抖动）稳定到 **0–1 ms**。
+
+### 实测（`python tools/selftest.py`，960×960@60，本机）
+
+| 指标 | 值 |
+| --- | --- |
+| 端到端帧率（模拟手机端收到并解码） | **60.3 fps** |
+| 每帧：抓屏 | 14.6 ms（DXGI 垂直同步等待，已被移出事件循环） |
+| 每帧：BGRA→编码器输入 | 0.5 ms |
+| 每帧：NVENC 编码 | 1.4 ms |
+| 每帧总计 | 15.1 ms |
+| WebSocket RTT | 0–1 ms |
+| 协商编码器 | `H264/90000`（pt 99），实际使用 `H264NvencEncoder` |
 
 ## 5. 触摸与分区映射
 

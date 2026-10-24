@@ -221,7 +221,18 @@
     stopPeer();
     const pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
     state.pc = pc;
-    pc.addTransceiver("video", { direction: "recvonly" });
+    const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
+    // Prefer H.264 (the PC encodes with NVENC); fall back to whatever is left.
+    try {
+      const caps = RTCRtpSender.getCapabilities("video");
+      if (caps && caps.codecs) {
+        const h264 = caps.codecs.filter((c) => (c.mimeType || "").toLowerCase() === "video/h264");
+        const rest = caps.codecs.filter((c) => (c.mimeType || "").toLowerCase() !== "video/h264");
+        if (h264.length && transceiver.setCodecPreferences) {
+          transceiver.setCodecPreferences(h264.concat(rest));
+        }
+      }
+    } catch (_) {}
     pc.ontrack = (event) => {
       video.srcObject = event.streams[0];
       const play = () => video.play().catch(() => {});

@@ -2,7 +2,9 @@
 
 Reverse-engineered facts this module relies on (see docs/re_maitouch.md):
 
-  mice.dll image base = 0x10000000 (ASLR disabled -> fixed)
+  mice.dll is loaded by the game at an arbitrary base (measured: 0x69690000;
+  its PE preferred base 0x10000000 is NOT used), so every address below is an
+  RVA and is resolved as `module_base + rva` at runtime.
   +0x0018B040  uint8[14]  touch status packet that mice writes to virtual COM3
                           layout: '(' , 12 sensor bytes, ')'
                           every sensor byte is 0x40 | bitmask
