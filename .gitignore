@@ -1,0 +1,24 @@
+# toolchains / SDKs (downloaded by tools/setup_android_toolchain.ps1)
+.tools/
+
+# build artefacts
+android/build/
+android/*.apk
+android/*.idsig
+android/debug.keystore
+
+# probe / benchmark output
+tools/probe_out/
+_*.txt
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# editors / os
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

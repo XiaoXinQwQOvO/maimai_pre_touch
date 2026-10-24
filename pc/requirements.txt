@@ -1,0 +1,11 @@
+# PC server dependencies (Python 3.10+; tested on 3.12 / Windows 11)
+aiohttp>=3.9
+aiortc>=1.9
+av>=12              # ships h264_nvenc in the bundled FFmpeg build
+numpy>=1.26
+dxcam>=0.0.5        # DXGI Desktop Duplication capture
+
+# optional: only needed when video.scale != 1.0
+# opencv-python>=4.9
+# optional: tools/make_icon.py
+# pillow>=10
