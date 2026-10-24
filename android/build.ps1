@@ -123,7 +123,7 @@ if (-not (Test-Path $keystore)) {
     --ks-key-alias androiddebugkey --out $finalApk $alignedApk
 if ($LASTEXITCODE -ne 0) { throw 'apksigner failed' }
 
-& $apksigner verify --print-certs $finalApk | Select-Object -First 3
+& $apksigner verify --print-certs $finalApk | Out-String -Stream | Select-Object -First 3 | ForEach-Object { Write-Host $_ }
 
 $size = [math]::Round((Get-Item $finalApk).Length / 1KB, 1)
 Write-Host "`nAPK ready: $finalApk ($size KB)" -ForegroundColor Green
@@ -133,3 +133,5 @@ if ($Install) {
     if (-not (Test-Path $adb)) { $adb = 'adb' }
     & $adb install -r $finalApk
 }
+
+exit 0
