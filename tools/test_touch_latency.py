@@ -1,4 +1,8 @@
-"""How long does a touch take from the phone's WebSocket message to the game's memory?"""
+"""How long does a touch take from the phone's WebSocket message to the game's memory?
+
+Polled with a busy loop: on Windows asyncio.sleep(0.0005) really sleeps ~15 ms, which
+would show up as a fake 15 ms of touch latency.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -50,7 +54,6 @@ async def main() -> int:
                     if sensors.sensors_in(port.read(MP.PACKET_RVA, sensors.PACKET_LEN)):
                         down_latency.append((time.perf_counter() - sent) * 1000)
                         break
-                    await asyncio.sleep(0.0005)
                 await ws.send_json({"t": "touch", "id": index, "a": "up"})
                 sent = time.perf_counter()
                 deadline = sent + 0.5
@@ -58,7 +61,6 @@ async def main() -> int:
                     if port.read(MP.PACKET_RVA, sensors.PACKET_LEN) == sensors.IDLE_PACKET:
                         up_latency.append((time.perf_counter() - sent) * 1000)
                         break
-                    await asyncio.sleep(0.0005)
                 await asyncio.sleep(0.05)
 
     port.restore()
